@@ -1,0 +1,53 @@
+[package]
+name = "cosmonic-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model Context Protocol server for Cosmonic Desktop — drives the local daemon's /v1 API over a unix socket or named pipe."
+publish = false
+
+# Two consumers, one implementation (issue #501):
+#   - the `cosmonic-mcp` binary, shipped standalone and inside the .mcpb bundle
+#   - `cosmonicd mcp serve`, which delegates to `serve()` so the daemon keeps
+#     working for everyone already registered against it
+#
+# Like `cosmonic-stdio`, this crate must NEVER depend on `cosmonic-host`: that
+# would drag the wash-runtime/wasmtime build into a binary meant to stay small
+# enough to ship in an .mcpb, and to be open-sourceable on its own. It talks to
+# the daemon only over the documented `/v1` HTTP-over-socket API, so it carries
+# no scheduling, runtime, or secrets-backend code at all.
+[lib]
+name = "cosmonic_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmonic-mcp"
+path = "src/main.rs"
+
+[dependencies]
+cosmonic-api = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "io-util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+
+# The official MCP Rust SDK.
+rmcp = { version = "1", default-features = false, features = [
+    "server",
+    "transport-io",
+    "macros",
+    "schemars",
+] }
+schemars = "1"
+
+# HTTP/1 over the daemon's unix socket / named pipe. Deliberately NOT reqwest:
+# the link is a local socket, so a TLS stack would be pure weight in a binary
+# meant to fit in an .mcpb bundle. Same stack as cosmonic-cli and cosmonic-stdio.
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
