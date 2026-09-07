@@ -245,6 +245,7 @@ pub struct ValidateWorkloadParams {
     /// The Workload to check (apiVersion/kind/metadata/spec). Accepts a JSON
     /// object, a JSON string, or a YAML manifest string, exactly like
     /// `cosmonic_workload_apply`.
+    #[schemars(schema_with = "object_or_yaml_string")]
     pub workload: Value,
 }
 
@@ -2135,7 +2136,10 @@ mod tests {
         assert_eq!(out["truncated"], json!(true));
         assert_eq!(out["totalMatched"], json!(150));
         assert_eq!(out["images"].as_array().unwrap().len(), 100);
-        assert!(out["truncationNote"].as_str().unwrap().contains("100 of 150"));
+        assert!(out["truncationNote"]
+            .as_str()
+            .unwrap()
+            .contains("100 of 150"));
 
         // `in_use` narrows BEFORE the page, so the count reports matches, not
         // the whole cache — 75 unused rows fit under the default limit and
