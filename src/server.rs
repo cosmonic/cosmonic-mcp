@@ -275,6 +275,74 @@ fn recovery_for_tool(code: &str, status: u16, tool: &str) -> String {
     }
 }
 
+/// Rewrite a tool's input schema into the portable subset before it goes on the
+/// wire.
+///
+/// Today that means one thing: **`"type"` as an ARRAY becomes `anyOf`**.
+/// `{"type": ["string", "null"]}` is legal JSON Schema and is exactly what
+/// schemars emits for `Option<String>`, but several MCP clients read `type` as
+/// a single string and either reject the tool outright or silently drop the
+/// constraint. `{"anyOf": [{"type": "string"}, {"type": "null"}]}` says the
+/// same thing in a form everything reads.
+///
+/// Found by the official MCP Inspector's schema-portability check (`--cli
+/// --strict`), which flagged 17 of these across 10 tools — including two this
+/// crate had just introduced by typing the `workload` parameter as
+/// `["object", "string"]`. Our own harness could not see them, because it
+/// shared this crate's assumptions about what a schema should look like.
+///
+/// Normalising centrally, at list time, is deliberate: it covers every tool
+/// that exists and every one added later, without asking each `#[tool]` author
+/// to remember. Sibling keywords are left in place — `anyOf` composes with
+/// `description`, `default`, `minimum` and friends.
+fn portable_tool(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    let mut value = Value::Object(std::mem::take(&mut schema));
+    split_type_arrays(&mut value);
+    if let Value::Object(obj) = value {
+        tool.input_schema = std::sync::Arc::new(obj);
+    }
+    tool
+}
+
+/// Recursively replace `{"type": [A, B, …]}` with `{"anyOf": [{"type": A}, …]}`.
+///
+/// A single-element array collapses to the plain string form rather than a
+/// one-branch `anyOf`, which is the same contract and less noise.
+fn split_type_arrays(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(types)) = map.get("type") {
+                let branches: Vec<Value> = types
+                    .iter()
+                    .filter(|t| t.is_string())
+                    .map(|t| json!({ "type": t }))
+                    .collect();
+                match branches.len() {
+                    0 => {}
+                    1 => {
+                        let only = branches[0]["type"].clone();
+                        map.insert("type".into(), only);
+                    }
+                    _ => {
+                        map.remove("type");
+                        map.insert("anyOf".into(), Value::Array(branches));
+                    }
+                }
+            }
+            for (_, v) in map.iter_mut() {
+                split_type_arrays(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                split_type_arrays(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Freshness hint for the lists that are compiled into the binary.
 ///
 /// The tool, prompt and resource-template sets are built once at construction
@@ -373,7 +441,13 @@ impl ServerHandler for CosmonicMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tool_router.list_all())
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(portable_tool)
+            .collect();
+        Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(STATIC_LIST_TTL_MS)
             .with_cache_scope(CacheScope::Public))
     }
@@ -689,6 +763,97 @@ mod tests {
     /// grouped and flagged at submission; worse, a mutation that is missing
     /// `destructiveHint` can be auto-approved by the client, so this is a
     /// security control and not metadata.
+    #[test]
+    fn type_arrays_become_any_of() {
+        // schemars renders `Option<String>` as `["string","null"]`, which several
+        // MCP clients read as a single string and then reject or silently drop.
+        let mut v = json!({
+            "type": "object",
+            "properties": {
+                "name":  { "type": ["string", "null"], "description": "keep me" },
+                "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": 500 },
+                "spec":  { "type": ["object", "string"] },
+                "plain": { "type": "string" },
+                "one":   { "type": ["boolean"] },
+                "nested": {
+                    "type": "object",
+                    "properties": { "deep": { "type": ["number", "null"] } }
+                }
+            }
+        });
+        split_type_arrays(&mut v);
+        let p = &v["properties"];
+
+        assert_eq!(
+            p["name"]["anyOf"],
+            json!([{"type":"string"},{"type":"null"}])
+        );
+        assert!(
+            p["name"].get("type").is_none(),
+            "the array form must be gone"
+        );
+        // Sibling keywords survive: anyOf composes with them.
+        assert_eq!(p["name"]["description"], json!("keep me"));
+        assert_eq!(p["limit"]["minimum"], json!(1));
+        assert_eq!(p["limit"]["maximum"], json!(500));
+        assert_eq!(
+            p["spec"]["anyOf"],
+            json!([{"type":"object"},{"type":"string"}])
+        );
+        // Already-portable schemas are left exactly as they were.
+        assert_eq!(p["plain"]["type"], json!("string"));
+        // A one-element array is the same contract as the bare string, so it
+        // collapses rather than becoming a pointless single-branch anyOf.
+        assert_eq!(p["one"]["type"], json!("boolean"));
+        assert!(p["one"].get("anyOf").is_none());
+        // Recursion reaches nested property schemas.
+        assert_eq!(
+            p["nested"]["properties"]["deep"]["anyOf"],
+            json!([{"type":"number"},{"type":"null"}])
+        );
+    }
+
+    /// The wire check: no tool this server serves may carry the array form.
+    /// This is what the MCP Inspector's `--strict` portability pass asserts,
+    /// pinned here so it cannot regress between audits.
+    #[test]
+    fn no_served_tool_uses_an_array_type() {
+        fn find_array_types(v: &Value, path: &str, out: &mut Vec<String>) {
+            match v {
+                Value::Object(map) => {
+                    if matches!(map.get("type"), Some(Value::Array(_))) {
+                        out.push(path.to_string());
+                    }
+                    for (k, vv) in map {
+                        find_array_types(vv, &format!("{path}.{k}"), out);
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, vv) in items.iter().enumerate() {
+                        find_array_types(vv, &format!("{path}[{i}]"), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // The router is what `list_tools` serves from, and building it needs no
+        // daemon — so this asserts the real surface without a socket.
+        let mut offenders = Vec::new();
+        for tool in CosmonicMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(portable_tool)
+        {
+            let schema = Value::Object((*tool.input_schema).clone());
+            find_array_types(&schema, &tool.name, &mut offenders);
+        }
+        assert!(
+            offenders.is_empty(),
+            "these schemas still use the array `type` form: {offenders:?}"
+        );
+    }
+
     #[test]
     fn every_tool_is_annotated_for_auto_permissions() {
         let tools = router().list_all();
