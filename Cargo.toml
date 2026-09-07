@@ -67,7 +67,7 @@ tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 
 # The official MCP Rust SDK.
-rmcp = { version = "1", default-features = false, features = [
+rmcp = { version = "3", default-features = false, features = [
     "server",
     "transport-io",
     "macros",

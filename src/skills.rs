@@ -52,7 +52,7 @@
 //! is the source of truth; run `node scripts/vendor-daemon-skills.mjs` and
 //! commit the diff.
 
-use rmcp::model::{AnnotateAble, RawResource, RawResourceTemplate, Resource, ResourceTemplate};
+use rmcp::model::{Resource, ResourceTemplate};
 use serde_json::json;
 
 /// Identifier of the MCP skills extension these resources implement.
@@ -280,19 +280,18 @@ pub fn index_json() -> String {
 /// list of large files, and a client that reads them all has paid 276 KB for
 /// what progressive disclosure exists to avoid.
 pub fn resources() -> Vec<Resource> {
-    let mut out = vec![RawResource::new(INDEX_URI, "skill-index")
+    let mut out = vec![Resource::new(INDEX_URI, "skill-index")
         .with_title("Skill catalog")
         .with_description(
             "Catalog of the skills this server publishes: name, trigger description, and the \
              URI of each SKILL.md. Read this first, then read only the skills whose \
              descriptions match the task.",
         )
-        .with_mime_type("application/json")
-        .no_annotation()];
+        .with_mime_type("application/json")];
 
     for skill in SKILLS {
         out.push(
-            RawResource::new(skill.entry_uri(), skill.name)
+            Resource::new(skill.entry_uri(), skill.name)
                 .with_title(format!("{} skill", skill.name))
                 .with_description(format!(
                     "{}\n\nThis playbook names its supporting files by path relative to the \
@@ -302,12 +301,11 @@ pub fn resources() -> Vec<Resource> {
                     skill.name
                 ))
                 .with_mime_type("text/markdown")
-                .with_size(clamp_size(skill.skill_md.len()))
-                .no_annotation(),
+                .with_size(clamp_size(skill.skill_md.len())),
         );
         for file in skill.files {
             out.push(
-                RawResource::new(
+                Resource::new(
                     skill.file_uri(file),
                     format!("{}/{}", skill.name, file.path),
                 )
@@ -317,8 +315,7 @@ pub fn resources() -> Vec<Resource> {
                     skill.name
                 ))
                 .with_mime_type(file.mime_type)
-                .with_size(clamp_size(file.text.len()))
-                .no_annotation(),
+                .with_size(clamp_size(file.text.len())),
             );
         }
     }
@@ -329,20 +326,18 @@ pub fn resources() -> Vec<Resource> {
 /// skill URI without enumerating every resource.
 pub fn resource_templates() -> Vec<ResourceTemplate> {
     vec![
-        RawResourceTemplate::new("skill://{skill}/SKILL.md", "skill-playbook")
+        ResourceTemplate::new("skill://{skill}/SKILL.md", "skill-playbook")
             .with_title("Skill playbook")
             .with_description(
                 "The SKILL.md of a named skill. Skill names come from skill://index.json.",
             )
-            .with_mime_type("text/markdown")
-            .no_annotation(),
-        RawResourceTemplate::new("skill://{skill}/{+path}", "skill-file")
+            .with_mime_type("text/markdown"),
+        ResourceTemplate::new("skill://{skill}/{+path}", "skill-file")
             .with_title("Skill supporting file")
             .with_description(
                 "A file bundled with a skill. Relative Markdown links inside a SKILL.md resolve \
                  against the skill root and produce these URIs.",
-            )
-            .no_annotation(),
+            ),
     ]
 }
 
@@ -366,8 +361,11 @@ pub fn read(uri: &str) -> Option<(&'static str, String)> {
 
 /// `Resource.size` is a `u32`; saturate rather than wrap on a hypothetical
 /// >4 GiB file, so a size can never be reported as a small number.
-fn clamp_size(len: usize) -> u32 {
-    u32::try_from(len).unwrap_or(u32::MAX)
+fn clamp_size(len: usize) -> u64 {
+    // rmcp 3 widened `Resource::size` from u32 to u64; the clamp stays because
+    // the field is advisory and a usize on a 128-bit-address future should not
+    // panic here.
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Read a single-line field out of a Markdown file's YAML frontmatter.
@@ -493,12 +491,12 @@ mod tests {
             "resources() is suspiciously small"
         );
         for resource in resources() {
-            let uri = &resource.raw.uri;
+            let uri = &resource.uri;
             let (mime, body) = read(uri).unwrap_or_else(|| panic!("listed but unreadable: {uri}"));
             assert!(!body.is_empty(), "{uri} is empty");
             // resources/list must report the same type resources/read returns,
             // or a client that keys off it re-parses the body.
-            if let Some(listed) = &resource.raw.mime_type {
+            if let Some(listed) = &resource.mime_type {
                 assert_eq!(listed, mime, "mime mismatch on {uri}");
             }
         }
@@ -683,10 +681,7 @@ mod tests {
     #[test]
     fn resource_templates_cover_both_tiers() {
         let templates = resource_templates();
-        let uris: Vec<_> = templates
-            .iter()
-            .map(|t| t.raw.uri_template.as_str())
-            .collect();
+        let uris: Vec<_> = templates.iter().map(|t| t.uri_template.as_str()).collect();
         assert!(uris.contains(&"skill://{skill}/SKILL.md"));
         assert!(uris.contains(&"skill://{skill}/{+path}"));
     }

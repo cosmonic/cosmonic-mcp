@@ -20,11 +20,12 @@ use std::sync::{Arc, OnceLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    AnnotateAble, CallToolRequestParams, CallToolResult, GetPromptRequestParams, GetPromptResult,
-    InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptArgument,
-    PromptMessage, PromptMessageRole, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
@@ -274,6 +275,23 @@ fn recovery_for_tool(code: &str, status: u16, tool: &str) -> String {
     }
 }
 
+/// Freshness hint for the lists that are compiled into the binary.
+///
+/// The tool, prompt and resource-template sets are built once at construction
+/// and cannot change while the process runs — a new build is a new process, and
+/// a stdio client re-spawns us — so an hour is an honest promise rather than a
+/// hopeful one.
+const STATIC_LIST_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// Freshness hint for the resource list, which is gated on a daemon feature
+/// flag an operator can flip while we are running. Short, because it can
+/// genuinely change under a client.
+const FLAGGED_LIST_TTL_MS: u64 = 60 * 1000;
+
+/// Freshness hint for reads that return live host state. Zero: these are the
+/// answer to "what is true right now", and a cached one is a wrong one.
+const LIVE_READ_TTL_MS: u64 = 0;
+
 impl ServerHandler for CosmonicMcp {
     /// The MCP handshake — and the only place we learn WHICH agent is driving
     /// us. rmcp's default implementation just stores the peer info and returns
@@ -335,12 +353,29 @@ impl ServerHandler for CosmonicMcp {
 
     // ---- tools: delegate to the generated router ----------------------------
 
+    // ---- cacheability (SEP-2549) --------------------------------------------
+    //
+    // `ttlMs` and `cacheScope` are required on every list/read result from
+    // protocol 2026-07-28. They are a freshness HINT, so the only way to get
+    // them wrong is to promise more stability than the thing actually has.
+    //
+    // The tool, prompt and template lists are built once when the server is
+    // constructed and cannot change while the process runs — a new build means
+    // a new process, and a stdio client re-spawns us. So an hour is honest, and
+    // `public` is accurate: they are identical for every user of a given build
+    // and carry no host state.
+    //
+    // The RESOURCE list is different: it is gated on a daemon feature flag the
+    // operator can flip under us, so it gets a short window and `private`.
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all())
+            .with_ttl_ms(STATIC_LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Public))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -351,7 +386,7 @@ impl ServerHandler for CosmonicMcp {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         // Capture the tool name for the whole dispatch so the daemon client tags
         // its requests with it (usage analytics — see CURRENT_TOOL).
         let tool = request.name.to_string();
@@ -378,29 +413,33 @@ impl ServerHandler for CosmonicMcp {
             .iter()
             .filter(|(uri, _, _)| *uri != "cosmonic://catalog" || catalog_enabled)
             .map(|(uri, name, desc)| {
-                rmcp::model::RawResource::new(*uri, *name)
+                Resource::new(*uri, *name)
                     .with_description(*desc)
                     .with_mime_type(resources::mime_for(uri))
-                    .no_annotation()
             })
             .collect();
         // Skills over MCP — the catalog first, then the playbooks it indexes.
         list.extend(skills::resources());
-        Ok(ListResourcesResult::with_all_items(list))
+        Ok(ListResourcesResult::with_all_items(list)
+            .with_ttl_ms(FLAGGED_LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.as_str();
         // Skills over MCP (`skill://…`) — a verbatim lookup in a static table,
         // so there is no filesystem and no traversal surface. See skills.rs.
         if let Some((mime, text)) = skills::read(uri) {
-            return Ok(ReadResourceResult::new(vec![text_contents(
-                uri, mime, text,
-            )]));
+            return Ok(
+                ReadResourceResult::new(vec![text_contents(uri, mime, text)])
+                    .with_ttl_ms(STATIC_LIST_TTL_MS)
+                    .with_cache_scope(CacheScope::Public)
+                    .into(),
+            );
         }
         // Composed grounding: what THIS host can run. Four best-effort reads,
         // because a partial picture beats none — an older daemon missing one
@@ -424,11 +463,12 @@ impl ServerHandler for CosmonicMcp {
                 nats.as_ref().ok(),
             );
             let text = serde_json::to_string_pretty(&caps).unwrap_or_else(|_| caps.to_string());
-            return Ok(ReadResourceResult::new(vec![text_contents(
-                uri,
-                "application/json",
-                text,
-            )]));
+            return Ok(
+                ReadResourceResult::new(vec![text_contents(uri, "application/json", text)])
+                    .with_ttl_ms(LIVE_READ_TTL_MS)
+                    .with_cache_scope(CacheScope::Private)
+                    .into(),
+            );
         }
         // Static grounding resource.
         if uri == "cosmonic://schema/workload" {
@@ -436,7 +476,10 @@ impl ServerHandler for CosmonicMcp {
                 uri,
                 "text/markdown",
                 resources::WORKLOAD_SCHEMA_DOC.to_owned(),
-            )]));
+            )])
+            .with_ttl_ms(STATIC_LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Public)
+            .into());
         }
         // Dynamic resources fetch from the daemon at read time.
         let path = match uri {
@@ -463,11 +506,12 @@ impl ServerHandler for CosmonicMcp {
                     v
                 };
                 let text = serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string());
-                Ok(ReadResourceResult::new(vec![text_contents(
-                    uri,
-                    "application/json",
-                    text,
-                )]))
+                Ok(
+                    ReadResourceResult::new(vec![text_contents(uri, "application/json", text)])
+                        .with_ttl_ms(LIVE_READ_TTL_MS)
+                        .with_cache_scope(CacheScope::Private)
+                        .into(),
+                )
             }
             // A feature-flagged resource answers 403; say what to do about it
             // rather than surfacing it as an opaque internal error.
@@ -487,9 +531,11 @@ impl ServerHandler for CosmonicMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult::with_all_items(
-            skills::resource_templates(),
-        ))
+        Ok(
+            ListResourceTemplatesResult::with_all_items(skills::resource_templates())
+                .with_ttl_ms(STATIC_LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Public),
+        )
     }
 
     // ---- prompts ------------------------------------------------------------
@@ -512,14 +558,16 @@ impl ServerHandler for CosmonicMcp {
                 prompt
             })
             .collect();
-        Ok(ListPromptsResult::with_all_items(list))
+        Ok(ListPromptsResult::with_all_items(list)
+            .with_ttl_ms(STATIC_LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Public))
     }
 
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         let Some(def) = prompts::get(&request.name) else {
             // Name every prompt there is: an unknown name is usually a typo or
             // a client showing a stale menu, and the list is short.
@@ -542,11 +590,11 @@ impl ServerHandler for CosmonicMcp {
             .filter(|v| !v.is_empty())
             .unwrap_or(def.missing_argument);
         let mut result = GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             (def.render)(argument),
         )]);
         result.description = Some(def.description.to_string());
-        Ok(result)
+        Ok(result.into())
     }
 }
 
