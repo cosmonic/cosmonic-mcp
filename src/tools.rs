@@ -154,9 +154,12 @@ pub struct ListImagesParams {
     /// (false). Unset returns both. `false` is the set a prune could reclaim.
     #[serde(default)]
     pub in_use: Option<bool>,
-    /// Max images to return, 1-1000. Unset returns the newest-first default of
-    /// 100 — a content-addressed cache grows without bound, and every row is a
-    /// digest, so an unfiltered dump is mostly hash.
+    /// Max images to return, 1-1000; default 100. The cache is listed in
+    /// reference order (alphabetical), NOT newest-first, so a shortened page
+    /// is the alphabetical head — raise `limit` or narrow with `in_use` rather
+    /// than concluding a later image is absent. A content-addressed cache
+    /// grows without bound and every row is a digest, which is why it is
+    /// paged at all.
     #[serde(default)]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<u32>,
@@ -1168,7 +1171,7 @@ impl CosmonicMcp {
     /// What is in the local content-addressed image cache.
     #[tool(
         title = "List cached images",
-        description = "Lists the component images in this host's content-addressed cache, with their digests and sizes, and whether a workload is using each, which is what bounds how much a prune could reclaim. Returns the first 100 by default; filter with `in_use` and `limit`.",
+        description = "Lists the component images in this host's content-addressed cache, with their digests and sizes, and whether a workload is using each, which is what bounds how much a prune could reclaim. Listed in reference order; returns the first 100 by default, and filters with `in_use` and `limit`.",
         annotations(
             title = "List cached images",
             read_only_hint = true,
@@ -1360,6 +1363,11 @@ fn note_truncation(rows: Value, matched: usize) -> Value {
 /// The image cache is content-addressed and grows with every pull, so the raw
 /// listing is unbounded — a 240-entry cache is already ~130 KB of mostly
 /// digest. A page plus a count is what a prune or an inspect actually needs.
+///
+/// `/v1/oci` sorts by reference (`oci.rs`), so a page is the alphabetical
+/// head, not the newest. Both the parameter description and the truncation
+/// note say so: an agent told "newest first" would read a short page as proof
+/// that a just-pulled image is not cached.
 const IMAGE_LIST_DEFAULT_LIMIT: usize = 100;
 
 /// Filter + page a `/v1/oci` listing, reporting what was left out.
@@ -1388,8 +1396,8 @@ fn shape_images(v: Value, in_use: Option<bool>, limit: Option<u32>) -> Value {
         "totalMatched": matched_count,
         "truncated": true,
         "truncationNote": format!(
-            "{shown} of {matched_count} matching images shown. Raise `limit`, or narrow with \
-             `in_use`."
+            "{shown} of {matched_count} matching images shown, in reference order (not \
+             newest-first). Raise `limit`, or narrow with `in_use`."
         ),
     })
 }
@@ -2136,10 +2144,11 @@ mod tests {
         assert_eq!(out["truncated"], json!(true));
         assert_eq!(out["totalMatched"], json!(150));
         assert_eq!(out["images"].as_array().unwrap().len(), 100);
-        assert!(out["truncationNote"]
-            .as_str()
-            .unwrap()
-            .contains("100 of 150"));
+        let note = out["truncationNote"].as_str().unwrap();
+        assert!(note.contains("100 of 150"), "{note}");
+        // The order matters to whoever reads a short page: `/v1/oci` sorts by
+        // reference, so "newest-first" would be a lie an agent acts on.
+        assert!(note.contains("reference order"), "{note}");
 
         // `in_use` narrows BEFORE the page, so the count reports matches, not
         // the whole cache — 75 unused rows fit under the default limit and
