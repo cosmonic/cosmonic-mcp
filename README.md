@@ -123,7 +123,7 @@ static table — no filesystem, so no path traversal.
 ## Security
 
 - **No new network surface** — stdio to the client, a local socket to the daemon.
-- **Secrets stay references.** `cosmonic_set_secret` writes to the OS keychain;
+- **Secrets stay references.** `cosmonic_secret_set` registers a reference (OS keychain, `env://`, 1Password, AWS Secrets Manager);
   values are never returned, logged, or included in an error. A workload whose
   `secretFrom` ref is missing is accepted and parked, and the result tells the
   agent what is missing and that the *user* enters it in Cosmonic Desktop.
@@ -139,11 +139,24 @@ static table — no filesystem, so no path traversal.
 
 ```console
 $ cargo build --release --bin cosmonic-mcp
+$ cargo test
 ```
+
+This is a self-contained workspace: the server, plus the `cosmonic-api` wire
+types it speaks, vendored under `crates/`. Nothing else is needed to build it.
 
 No `cosmonic-host` dependency, by design: that would pull the whole
 wash-runtime/wasmtime build into a binary meant to stay small enough to ship
-inside an [MCP Bundle](https://github.com/modelcontextprotocol/mcpb).
+inside an [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) — the
+bundle is built in
+[`cosmonic/claude-mcpb`](https://github.com/cosmonic/claude-mcpb).
+
+Source is synced from the monorepo where it is developed:
+
+```console
+$ ./scripts/sync-from-desktop.sh ../desktop
+$ ./scripts/sync-from-desktop.sh ../desktop --check   # CI: fail on drift
+```
 
 ## License
 

@@ -1,3 +1,33 @@
+# `cosmonic-mcp` — the Model Context Protocol server for Cosmonic Desktop.
+#
+# A self-contained workspace: this package plus the vendored `cosmonic-api`
+# wire types it speaks. Nothing else from cosmonic/desktop is needed, and
+# nothing here pulls in a Wasm runtime — see the note on the package below.
+[workspace]
+resolver = "2"
+members = ["crates/cosmonic-api"]
+
+[workspace.package]
+# Tracks the Cosmonic Desktop release this server is cut against; the version
+# is what `initialize` reports back to the client.
+version = "0.5.28"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cosmonic/cosmonic-mcp"
+
+[workspace.dependencies]
+cosmonic-api = { path = "crates/cosmonic-api" }
+
+anyhow = "1"
+dirs = "6"
+hyper = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "sync", "time", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
+
 [package]
 name = "cosmonic-mcp"
 version.workspace = true
@@ -51,3 +81,11 @@ schemars = "1"
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+
+# The monorepo's release profile, restated because a standalone build does not
+# inherit it. Kept IDENTICAL on purpose: the binary in the `.mcpb` and the one
+# `cosmonicd mcp serve` runs should be the same shape, so a bug does not
+# reproduce on only one of them.
+[profile.release]
+lto = "thin"
+strip = true

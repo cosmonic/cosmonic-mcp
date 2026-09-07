@@ -1,0 +1,16 @@
+[package]
+name = "cosmonic-api"
+description = "Shared wire types for the Cosmonic Desktop daemon's local /v1 API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Vendored from cosmonic/desktop (daemon/crates/cosmonic-api) by
+# scripts/sync-from-desktop.sh. It is the WIRE CONTRACT between the daemon and
+# this server, so it lives beside the server that speaks it rather than being
+# reimplemented here — and it depends on nothing but serde, which is what makes
+# carrying a copy cheap.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

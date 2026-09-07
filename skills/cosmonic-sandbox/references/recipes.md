@@ -93,8 +93,11 @@ message varies by toolchain version). The `rust-version = "1.94"` in the
 `Cargo.toml` above turns that into a clear `requires rustc 1.94` instead. rustc
 uses its *bundled* `wasm-component-ld`, so a newer standalone one on your PATH
 (the runtime `wasmtime` shadow below is a separate thing) does not help here.
-Cosmonic Desktop's managed toolchain already satisfies this, so it only bites a
-hand-rolled older toolchain. Re-check the floor if you bump `wasip3`/`wit-bindgen`.
+A plain `cargo build` uses whatever Rust is active on your PATH, not the version
+Cosmonic pins, so it is your active toolchain that must clear 1.94. When Desktop
+installs Rust for you it provisions a version above the floor; when you bring your
+own toolchain, confirm the one `cargo build` resolves to is 1.94+ with `rustc
+--version`. Re-check the floor if you bump `wasip3`/`wit-bindgen`.
 
 ### Running a p3 component with the standalone `wasmtime` CLI (optional)
 

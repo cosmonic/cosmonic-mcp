@@ -160,6 +160,10 @@ drafts all use this form; `.localhost` names resolve to loopback on macOS, Linux
 it back (`cosmonic_workload_get`, or the publish draft) rather than assuming. For an MCP
 server the same host must also be in `MCP_ALLOWED_HOSTS` (`references/mcp-servers.md`).
 
+The ingress **port** is `8200` by **default** but is user-configurable (Settings). Every `:8200`
+in this skill is that default; take the real port from `cosmonic_host_status`'s `ingressBaseUrl`,
+and use it in both the verify curl and the URL you hand back.
+
 For **verification**, use the Host-header form — it proves routing without depending on the resolver:
 
 ```bash
@@ -216,6 +220,12 @@ re-used tag keeps serving the old build even across restarts, because the applie
 digest-pinned to the tag's first content. See `references/oci-registry.md`.
 
 ### 6. Apply the Workload
+
+**Stop the dev session first: `cosmonic_dev_stop`.** A running `cosmonic dev` holds an
+ephemeral workload in the `dev` namespace bound to the **same** `<NAME>.localhost` ingress host as
+the durable Workload you are about to apply. Ingress is first-binder-wins, so if you leave dev
+running the dev instance keeps the host and the durable Workload reports `running` while serving
+nothing. Stop dev, then apply.
 
 `cosmonic_workload_apply` takes a **flat `Workload`** (JSON or YAML) — top-level `spec.components`
 and `spec.hostInterfaces`. It does **not** accept the `spec.template.spec` nesting of a
@@ -330,6 +340,9 @@ prompt scripts the same loop; where it disagrees with this file (it still says
 - **MCP server answers 403 / "Forbidden"** → `MCP_ALLOWED_HOSTS` does not list the ingress host.
 - **Every outbound call fails** although the code is right → a missing `allowedHosts` entry.
 - **Redeploy still serves the old behavior** → you re-used an image tag; bump it and re-apply.
+- **Durable Workload reports `running` but serves the old dev behavior (or two workloads claim one
+  host)** → a `cosmonic dev` session is still bound to `<NAME>.localhost`. First binder wins, so the
+  dev instance keeps the traffic. `cosmonic_dev_stop` before every apply.
 - **`missing field 'components'`** → you applied a nested `WorkloadDeployment`; flatten it.
 - **`poolSize` did nothing** → the component is p2 (`incoming-handler`); only p3 pools.
 - **500 on every request while `running`** → a panic (`unwrap`/`[]`) or an egress denial; both are

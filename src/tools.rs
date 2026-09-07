@@ -71,7 +71,21 @@ pub struct ApplyParams {
     /// object, a JSON string, OR a YAML manifest string — paste a `kubectl
     /// apply`-style YAML directly, no transform needed. See the
     /// `cosmonic://schema/workload` resource for the shape + an example.
+    #[schemars(schema_with = "object_or_yaml_string")]
     pub workload: Value,
+}
+
+/// Schema for a parameter that takes either a JSON object or a manifest
+/// string.
+///
+/// `Value`'s own schema is `true` — "anything" with no `type` at all. That is
+/// legal JSON Schema, but a client generating arguments has nothing to aim at,
+/// and the stricter function-calling backends reject a typeless property
+/// outright. Naming the two shapes we actually accept costs nothing and is
+/// the truth: `serde_yaml` parses JSON too, so an object and a YAML/JSON
+/// string are the whole domain.
+fn object_or_yaml_string(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": ["object", "string"] })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -131,6 +145,20 @@ pub struct ListWorkloadsParams {
     /// Max workloads to return, 1-500. Unset returns all of them.
     #[serde(default)]
     #[schemars(range(min = 1, max = 500))]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListImagesParams {
+    /// Only images a workload is currently using (true), or only unused ones
+    /// (false). Unset returns both. `false` is the set a prune could reclaim.
+    #[serde(default)]
+    pub in_use: Option<bool>,
+    /// Max images to return, 1-1000. Unset returns the newest-first default of
+    /// 100 — a content-addressed cache grows without bound, and every row is a
+    /// digest, so an unfiltered dump is mostly hash.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<u32>,
 }
 
@@ -549,7 +577,7 @@ impl CosmonicMcp {
     /// Turn an OCI ref or repo URL into draft Workloads. Schedules nothing.
     #[tool(
         title = "Draft a workload from an image or repo",
-        description = "Turns an OCI image reference or a GitHub/GitLab repository URL into one or more DRAFT Workload specs with review notes, inferring interfaces from the component's WIT world. Schedules nothing — review the draft, then pass it to cosmonic_workload_apply. Pulls from the registry or repository to do it.",
+        description = "Turns an OCI image reference or a GitHub/GitLab repository URL into one or more DRAFT Workload specs with review notes, inferring interfaces from the component's WIT world. Schedules nothing: the draft is a spec for review, and is the shape cosmonic_workload_apply takes. Pulls from the registry or repository to build it.",
         annotations(
             title = "Draft a workload from an image or repo",
             read_only_hint = true,
@@ -969,7 +997,7 @@ impl CosmonicMcp {
     /// The secret reference NAMES registered here.
     #[tool(
         title = "List secret references",
-        description = "Lists the registered secret reference names, the environment variable each is injected as, and its backend scheme. Never returns a value. Read it before authoring `secretFrom` so a Workload names a reference that exists rather than parking on a typo.",
+        description = "Lists the registered secret reference names, the environment variable each is injected as, and its backend scheme. Never returns a value. A Workload whose `secretFrom` names a reference that is not in this list is accepted but parks instead of starting, so a typo shows up here as an absence.",
         annotations(
             title = "List secret references",
             read_only_hint = true,
@@ -1039,7 +1067,7 @@ impl CosmonicMcp {
     /// Create or replace a named config.
     #[tool(
         title = "Set a named config",
-        description = "Creates or REPLACES a named config that Workloads reference from `configFrom`. The whole map is replaced, not merged — read the current one with cosmonic_config_list first if you mean to add a key. Do not put secrets here; use cosmonic_secret_set.",
+        description = "Creates or REPLACES a named config that Workloads reference from `configFrom`. The whole map is REPLACED, not merged, so a partial map drops the keys it leaves out; cosmonic_config_list returns the current one. Values are stored and injected in the clear — a secret value belongs in a secret reference instead.",
         annotations(
             title = "Set a named config",
             read_only_hint = false,
@@ -1063,7 +1091,7 @@ impl CosmonicMcp {
     /// Where images can be pushed and pulled from.
     #[tool(
         title = "List registries",
-        description = "Lists the OCI registries this host knows: those read from the shared ~/.docker/config.json convention, those added here, and the built-in local registry. Read it to choose a publish target.",
+        description = "Lists the OCI registries this host knows: those read from the shared ~/.docker/config.json convention, those added here, and the built-in local registry — the set a publish or pull can name.",
         annotations(
             title = "List registries",
             read_only_hint = true,
@@ -1139,7 +1167,7 @@ impl CosmonicMcp {
     /// What is in the local content-addressed image cache.
     #[tool(
         title = "List cached images",
-        description = "Lists the component images in this host's content-addressed cache, with their digests and sizes, and whether a workload is using each. Read it before pruning.",
+        description = "Lists the component images in this host's content-addressed cache, with their digests and sizes, and whether a workload is using each, which is what bounds how much a prune could reclaim. Returns the first 100 by default; filter with `in_use` and `limit`.",
         annotations(
             title = "List cached images",
             read_only_hint = true,
@@ -1147,11 +1175,16 @@ impl CosmonicMcp {
             open_world_hint = false
         )
     )]
-    pub async fn cosmonic_image_list(&self) -> CallToolResult {
-        self.reply(
-            self.client.get("/v1/oci").await,
-            &["cosmonic_image_prune", "cosmonic_image_inspect"],
-        )
+    pub async fn cosmonic_image_list(
+        &self,
+        Parameters(p): Parameters<ListImagesParams>,
+    ) -> CallToolResult {
+        let res = self
+            .client
+            .get("/v1/oci")
+            .await
+            .map(|v| shape_images(v, p.in_use, p.limit));
+        self.reply(res, &["cosmonic_image_prune", "cosmonic_image_inspect"])
     }
 
     /// Reclaim cache space.
@@ -1317,6 +1350,45 @@ fn note_truncation(rows: Value, matched: usize) -> Value {
         "truncationNote": format!(
             "{shown} of {matched} matching workloads shown. Raise `limit`, or narrow with \
              `namespace`/`state`."
+        ),
+    })
+}
+
+/// Default page size for `cosmonic_image_list`.
+///
+/// The image cache is content-addressed and grows with every pull, so the raw
+/// listing is unbounded — a 240-entry cache is already ~130 KB of mostly
+/// digest. A page plus a count is what a prune or an inspect actually needs.
+const IMAGE_LIST_DEFAULT_LIMIT: usize = 100;
+
+/// Filter + page a `/v1/oci` listing, reporting what was left out.
+///
+/// Mirrors [`note_truncation`]: a complete list stays a bare array, which is
+/// the shape callers already parse; only a shortened one is wrapped.
+fn shape_images(v: Value, in_use: Option<bool>, limit: Option<u32>) -> Value {
+    let Some(all) = v.as_array() else { return v };
+    let matched: Vec<Value> = all
+        .iter()
+        .filter(|row| {
+            in_use.is_none_or(|want| row.get("inUse").and_then(Value::as_bool) == Some(want))
+        })
+        .cloned()
+        .collect();
+    let matched_count = matched.len();
+    let limit = limit.map_or(IMAGE_LIST_DEFAULT_LIMIT, |l| l as usize);
+    let mut rows = matched;
+    rows.truncate(limit);
+    let shown = rows.len();
+    if shown >= matched_count {
+        return Value::Array(rows);
+    }
+    json!({
+        "images": rows,
+        "totalMatched": matched_count,
+        "truncated": true,
+        "truncationNote": format!(
+            "{shown} of {matched_count} matching images shown. Raise `limit`, or narrow with \
+             `in_use`."
         ),
     })
 }
@@ -2049,6 +2121,41 @@ mod tests {
         assert_eq!(out["totalMatched"], json!(9));
         assert_eq!(out["workloads"].as_array().unwrap().len(), 2);
         assert!(out["truncationNote"].as_str().unwrap().contains("2 of 9"));
+    }
+
+    #[test]
+    fn shape_images_pages_and_filters() {
+        let rows: Vec<Value> = (0..150)
+            .map(|i| json!({ "digest": format!("sha256:{i}"), "inUse": i % 2 == 0 }))
+            .collect();
+        let all = Value::Array(rows);
+
+        // Default page: 100 of 150, wrapped with the count that was left out.
+        let out = shape_images(all.clone(), None, None);
+        assert_eq!(out["truncated"], json!(true));
+        assert_eq!(out["totalMatched"], json!(150));
+        assert_eq!(out["images"].as_array().unwrap().len(), 100);
+        assert!(out["truncationNote"].as_str().unwrap().contains("100 of 150"));
+
+        // `in_use` narrows BEFORE the page, so the count reports matches, not
+        // the whole cache — 75 unused rows fit under the default limit and
+        // come back as a bare array.
+        let unused = shape_images(all.clone(), Some(false), None);
+        let arr = unused.as_array().expect("a complete list stays an array");
+        assert_eq!(arr.len(), 75);
+        assert!(arr.iter().all(|r| r["inUse"] == json!(false)));
+
+        // An explicit limit wins.
+        let two = shape_images(all, Some(true), Some(2));
+        assert_eq!(two["images"].as_array().unwrap().len(), 2);
+        assert_eq!(two["totalMatched"], json!(75));
+    }
+
+    #[test]
+    fn shape_images_passes_a_non_array_through() {
+        // An error object or an unexpected shape must not be swallowed.
+        let err = json!({ "message": "boom" });
+        assert_eq!(shape_images(err.clone(), Some(true), Some(1)), err);
     }
 
     #[test]

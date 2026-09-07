@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
-Cargo.lock
+
+# Cargo.lock IS committed: this repo builds a binary that ships inside a
+# downloadable bundle, and the same lock is what makes the standalone build and
+# `cosmonicd mcp serve` produce the same tool surface on the wire.

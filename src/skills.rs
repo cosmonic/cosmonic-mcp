@@ -379,7 +379,14 @@ fn clamp_size(len: usize) -> u32 {
 /// arrives without a single-line `description`, so a silently empty trigger
 /// cannot reach the catalog.
 fn frontmatter_field(markdown: &'static str, field: &str) -> Option<&'static str> {
-    let body = markdown.strip_prefix("---\n")?;
+    // CRLF-tolerant. Git checks these files out with CRLF on Windows, and a
+    // parser that only knew `---\n` returned None for every field there — so
+    // every skill's trigger description was the empty string on Windows, which
+    // publishes a skill no model can ever match. The catalog looks fine; only
+    // the matching silently stops working.
+    let body = markdown
+        .strip_prefix("---\n")
+        .or_else(|| markdown.strip_prefix("---\r\n"))?;
     let end = body.find("\n---")?;
     for line in body[..end].lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -388,7 +395,7 @@ fn frontmatter_field(markdown: &'static str, field: &str) -> Option<&'static str
         if key.trim() != field {
             continue;
         }
-        let value = value.trim();
+        let value = value.trim().trim_end_matches('\r');
         let unquoted = value
             .strip_prefix('"')
             .and_then(|rest| rest.strip_suffix('"'))
@@ -413,7 +420,7 @@ mod tests {
         assert!(!SKILLS.is_empty(), "the vendor step produced no skills");
         for skill in SKILLS {
             assert!(
-                skill.skill_md.starts_with("---\n"),
+                skill.skill_md.starts_with("---\n") || skill.skill_md.starts_with("---\r\n"),
                 "{}: SKILL.md has no frontmatter",
                 skill.name
             );
@@ -703,6 +710,24 @@ mod tests {
         );
         assert!(!links.contains(&"code.rs".to_string()));
         assert!(!links.contains(&"d.png".to_string()));
+    }
+
+    #[test]
+    fn frontmatter_field_reads_a_crlf_checkout() {
+        // Windows git checks these out with CRLF. A parser that only knew LF
+        // returned None for every field, so every trigger description was ""
+        // there — a skill published that no request can match.
+        const CRLF: &str = "---\r\nname: demo\r\ndescription: a windows one\r\n---\r\nbody\r\n";
+        assert_eq!(frontmatter_field(CRLF, "name"), Some("demo"));
+        assert_eq!(
+            frontmatter_field(CRLF, "description"),
+            Some("a windows one")
+        );
+        const CRLF_QUOTED: &str = "---\r\ndescription: \"quoted\"\r\n---\r\nbody\r\n";
+        assert_eq!(
+            frontmatter_field(CRLF_QUOTED, "description"),
+            Some("quoted")
+        );
     }
 
     #[test]
