@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: cargo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # The conformance pass, driven by the OFFICIAL PYTHON MCP SDK.
+  #
+  # `cargo test` above and the e2e in cosmonic/desktop are both written against
+  # the same assumptions this crate is, so neither can catch a mistake that is
+  # *consistent* with those assumptions — a schema shape every client but ours
+  # rejects, a field the Rust SDK serialises in a way only the Rust SDK reads
+  # back. This job drives the server with an implementation that shares nothing
+  # with it: different language, different SDK, different JSON-RPC stack.
+  #
+  # Not hypothetical. The MCP Inspector found 17 schema-portability problems
+  # here that a hand-rolled driver had passed clean, two of them introduced by
+  # the very audit that wrote the driver.
+  conformance:
+    name: conformance (python mcp sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: cargo build --release --bin cosmonic-mcp
+
+      - name: Install the official Python MCP SDK
+        run: pip install "mcp==2.2.0"
+
+      # Needs no daemon: every assertion is about the protocol surface, which
+      # the server answers whether or not cosmonicd is running.
+      - name: Conformance
+        run: python tests/conformance_test.py target/release/cosmonic-mcp
