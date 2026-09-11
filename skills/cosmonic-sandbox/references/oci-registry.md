@@ -45,9 +45,11 @@ pushed images survive restarts.
 
 `cosmonic_project_publish` pushes for you (preferred: it returns a durable Workload draft):
 ```
-cosmonic_project_publish(project_id="<id>", reference="oci.localhost:8200/apps/<name>:0.1.0", insecure=true, confirm=true)
+cosmonic_project_publish(project_id="<id>", reference="<name>:0.1.0", confirm=true)
 ```
-`insecure=true` is required because the local registry serves plain HTTP.
+A reference with no registry goes to the built-in registry (never Docker Hub), and a loopback target
+(the built-in registry, `localhost`, `127.0.0.1`) is pushed over plain HTTP automatically —
+`insecure=true` is only needed for a non-loopback plain-HTTP registry.
 
 Manual push (any OCI client works; note the **two-segment** repo path `apps/<name>`):
 ```bash

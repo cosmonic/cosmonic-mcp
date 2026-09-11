@@ -366,12 +366,13 @@ impl CosmonicMcp {
     }
 
     /// List the starter project templates you can scaffold from (rust-http,
-    /// go-http, ts-http, rust-mcp, and the fourteen `<lang>-nats-<pattern>`
-    /// wasmcloud:nats starters) and which are tested. Returns template ids,
+    /// go-http, ts-http, rust-mcp, the fourteen `<lang>-nats-<pattern>`
+    /// wasmcloud:nats starters and the four `rust-kafka-<pattern>`
+    /// cosmonic:kafka starters) and which are tested. Returns template ids,
     /// names, languages, and descriptions.
     #[tool(
         title = "List project templates",
-        description = "Lists the starter templates a new component project can be scaffolded from — rust-http/go-http/ts-http (HTTP), rust-mcp (MCP server), and rust-/go-nats-<pattern> (NATS) — with their language and toolchain requirements. Filter with `language`.",
+        description = "Lists the starter templates a new component project can be scaffolded from — rust-http/go-http/ts-http (HTTP), rust-mcp (MCP server), rust-/go-nats-<pattern> (NATS) and rust-kafka-<pattern> (Kafka) — with their language and toolchain requirements. Filter with `language`.",
         annotations(
             title = "List project templates",
             read_only_hint = true,
@@ -479,6 +480,13 @@ impl CosmonicMcp {
         &self,
         Parameters(p): Parameters<ListWorkloadsParams>,
     ) -> CallToolResult {
+        if let Some(m) = limit_out_of_range(p.limit, 500) {
+            return self.fail(
+                "invalid_limit",
+                m,
+                "Pass `limit` in range, or omit it to return every match.",
+            );
+        }
         let res = self.client.get("/v1/workloads").await.map(|v| {
             let matched = filter_workloads(v, p.namespace.as_deref(), p.state.as_deref(), None);
             let matched_count = matched.as_array().map_or(0, |a| a.len());
@@ -533,6 +541,13 @@ impl CosmonicMcp {
         &self,
         Parameters(p): Parameters<LogsParams>,
     ) -> CallToolResult {
+        if let Some(m) = limit_out_of_range(p.limit, 2000) {
+            return self.fail(
+                "invalid_limit",
+                m,
+                "Pass `limit` in range, or omit it for the default of 50.",
+            );
+        }
         let mut q: Vec<String> = Vec::new();
         if let Some(v) = &p.level {
             q.push(format!("level={}", enc(v)));
@@ -1183,6 +1198,13 @@ impl CosmonicMcp {
         &self,
         Parameters(p): Parameters<ListImagesParams>,
     ) -> CallToolResult {
+        if let Some(m) = limit_out_of_range(p.limit, 1000) {
+            return self.fail(
+                "invalid_limit",
+                m,
+                "Pass `limit` in range, or omit it for the default of 100.",
+            );
+        }
         let res = self
             .client
             .get("/v1/oci")
@@ -1369,6 +1391,20 @@ fn note_truncation(rows: Value, matched: usize) -> Value {
 /// note say so: an agent told "newest first" would read a short page as proof
 /// that a just-pulled image is not cached.
 const IMAGE_LIST_DEFAULT_LIMIT: usize = 100;
+
+/// The schema says `limit` is `1..=max`, but a schema is advice to the client,
+/// not enforcement: a `limit: 0` used to come back as an empty page with a
+/// truncation note ("0 of 247 shown"), which is silently accepting invalid
+/// input and dressing it up as a result. `Some(message)` when the value is
+/// outside the range the schema advertises, worded so the caller can fix it.
+fn limit_out_of_range(limit: Option<u32>, max: u32) -> Option<String> {
+    match limit {
+        Some(l) if l == 0 || l > max => Some(format!(
+            "`limit` must be between 1 and {max}; got {l}. Omit it for the default."
+        )),
+        _ => None,
+    }
+}
 
 /// Filter + page a `/v1/oci` listing, reporting what was left out.
 ///
@@ -1869,6 +1905,22 @@ fn enc(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_limit_outside_the_advertised_range_is_refused_not_paged() {
+        // limit: 0 used to return "0 of N shown" — an empty page for invalid
+        // input. The schema's 1..=max is enforced here, in words.
+        let m = super::limit_out_of_range(Some(0), 1000).expect("0 is refused");
+        assert!(
+            m.contains("between 1 and 1000") && m.contains("got 0"),
+            "{m}"
+        );
+        let m = super::limit_out_of_range(Some(1001), 1000).expect("above max is refused");
+        assert!(m.contains("got 1001"), "{m}");
+        assert!(super::limit_out_of_range(Some(1), 1000).is_none());
+        assert!(super::limit_out_of_range(Some(1000), 1000).is_none());
+        assert!(super::limit_out_of_range(None, 1000).is_none());
+    }
+
     use super::*;
 
     #[test]

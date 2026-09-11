@@ -131,11 +131,10 @@ impl CosmonicMcp {
                 format!("Could not reach the Cosmonic daemon: {m}"),
                 "Start Cosmonic Desktop (or run `cosmonicd`) so the daemon's unix socket is available, then retry. Confirm with `cosmonic_host_status`.",
             ),
-            Err(DaemonError::Api { status, code, message }) => self.fail(
-                &code,
-                format!("{message} (HTTP {status})"),
-                recovery_for(&code, status),
-            ),
+            Err(DaemonError::Api { status, code, message }) => {
+                let (code, recovery) = refine(code, status, &message);
+                self.fail(&code, format!("{message} (HTTP {status})"), recovery)
+            }
             Err(DaemonError::Transport(m)) => self.fail(
                 "transport_error",
                 m,
@@ -157,6 +156,38 @@ impl CosmonicMcp {
 fn recovery_for(code: &str, status: u16) -> String {
     let tool = CURRENT_TOOL.try_with(|t| t.clone()).unwrap_or_default();
     recovery_for_tool(code, status, &tool)
+}
+
+/// The daemon's code + a recovery hint, with the one case the daemon leaves
+/// generic made specific here.
+///
+/// A Workload body that does not deserialize comes back as a 422 whose code
+/// is the bare `error` and whose message is serde's — `missing field
+/// \`components\`` when the caller pasted a `WorkloadDeployment` /
+/// `HTTPTrigger` (the `spec.template.spec` nesting) instead of a flat
+/// `Workload`. That is by far the most common way an apply or validate fails
+/// to parse, and "Inspect the error message; check the logs" is not a
+/// recovery for it. The code becomes `invalid_workload` (what a 400 from the
+/// same tools already says) and the hint names the flattening.
+fn refine(code: String, status: u16, message: &str) -> (String, String) {
+    let tool = CURRENT_TOOL.try_with(|t| t.clone()).unwrap_or_default();
+    refine_for_tool(code, status, message, &tool)
+}
+
+fn refine_for_tool(code: String, status: u16, message: &str, tool: &str) -> (String, String) {
+    if status == 422 && subject_of(tool) == Subject::Workload {
+        let recovery = if message.contains("missing field `components`") {
+            "This is the nested `WorkloadDeployment` / `HTTPTrigger` shape. Apply a flat \
+             `Workload` with top-level `spec.components` and `spec.hostInterfaces` — the \
+             `cosmonic://schema/workload` resource has the shape and a worked example."
+                .to_string()
+        } else {
+            recovery_for_tool("invalid_workload", 400, tool)
+        };
+        return ("invalid_workload".to_string(), recovery);
+    }
+    let recovery = recovery_for_tool(&code, status, tool);
+    (code, recovery)
 }
 
 /// The subject a tool operates on, for wording a `not_found` or a 400.
@@ -183,12 +214,16 @@ fn subject_of(tool: &str) -> Subject {
         | "cosmonic_workload_delete"
         | "cosmonic_workload_apply"
         | "cosmonic_workload_list"
+        | "cosmonic_workload_validate"
+        | "cosmonic_workload_revision_list"
+        | "cosmonic_workload_rollback"
         | "cosmonic_workload_credentials_test" => Subject::Workload,
         "cosmonic_dev_start"
         | "cosmonic_dev_stop"
         | "cosmonic_dev_status"
         | "cosmonic_dev_logs"
         | "cosmonic_project_publish"
+        | "cosmonic_project_delete"
         | "cosmonic_project_list" => Subject::Project,
         "cosmonic_image_inspect" | "cosmonic_workload_draft" => Subject::Image,
         "cosmonic_project_create" => Subject::Template,
@@ -1248,6 +1283,52 @@ mod tests {
         // The Workload schema hint survives where it is actually right.
         let apply = recovery_for_tool("invalid_workload", 400, "cosmonic_workload_apply");
         assert!(apply.contains("cosmonic://schema/workload"), "{apply}");
+    }
+
+    #[test]
+    fn a_nested_workload_deployment_gets_the_flattening_hint() {
+        // The daemon answers a serde failure with a 422 and the bare code
+        // `error`; the MCP layer is where it becomes actionable.
+        let serde = "Failed to deserialize the JSON body into the target type: spec: missing field `components` at line 1 column 60";
+        for tool in ["cosmonic_workload_apply", "cosmonic_workload_validate"] {
+            let (code, hint) = refine_for_tool("error".into(), 422, serde, tool);
+            assert_eq!(code, "invalid_workload", "{tool}");
+            assert!(hint.contains("flat `Workload`"), "{tool}: {hint}");
+            assert!(hint.contains("spec.components"), "{tool}: {hint}");
+        }
+        // Any other 422 from a workload tool still gets the schema hint...
+        let (code, hint) = refine_for_tool(
+            "error".into(),
+            422,
+            "unknown field `foo`",
+            "cosmonic_workload_apply",
+        );
+        assert_eq!(code, "invalid_workload");
+        assert!(hint.contains("cosmonic://schema/workload"), "{hint}");
+        // ...and a 422 elsewhere is left exactly as the daemon said it.
+        let (code, hint) = refine_for_tool("error".into(), 422, serde, "cosmonic_project_create");
+        assert_eq!(code, "error");
+        assert!(!hint.contains("flat `Workload`"), "{hint}");
+    }
+
+    #[test]
+    fn the_newer_workload_and_project_tools_are_classified() {
+        // Added in #503 after subject_of was written; they were falling to
+        // Subject::Other, so revision_list's not_found named no list tool.
+        for tool in [
+            "cosmonic_workload_validate",
+            "cosmonic_workload_revision_list",
+            "cosmonic_workload_rollback",
+        ] {
+            assert!(
+                recovery_for_tool("not_found", 404, tool).contains("cosmonic_workload_list"),
+                "{tool}"
+            );
+        }
+        assert!(
+            recovery_for_tool("not_found", 404, "cosmonic_project_delete")
+                .contains("cosmonic_project_list")
+        );
     }
 
     #[test]
