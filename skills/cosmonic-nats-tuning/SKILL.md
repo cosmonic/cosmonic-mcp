@@ -1,10 +1,10 @@
 ---
 name: cosmonic-nats-tuning
-description: Size and debug a wasmcloud:nats workload on Cosmonic Desktop from measured numbers, not guesses. Subscription-capacity and max-in-flight against bursts, JetStream ack windows and max-ack-pending, large payloads (1 to 5 MB) and the NATS server profile they need, poolSize and instance reuse, fan-out memory, and the full error catalogue (shedding, backlog full, host memory budget, the OOM signature behind nats IO error storms, DUPLICATES, vanished ephemeral consumers, KV ack timeouts, already-settled, ack-owned-by-host, limit-exceeded fetches, the Go timer trap). Use when a NATS component drops or duplicates messages, stops receiving with no error, reports nats IO error or disconnected, needs more throughput or a bigger payload, or before changing any capacity, ack, timeout, or poolSize setting. Companion to cosmonic-nats (building the component) and cosmonic-sandbox (the deploy loop).
+description: Size and debug a wasmcloud:nats workload on Cosmonic Desktop from measured numbers, not guesses. Subscription-capacity and max-in-flight against bursts, JetStream ack windows and max-ack-pending, large payloads (1 to 5 MB) and the NATS server profile they need, poolSize and instance reuse, fan-out memory, and the full error catalogue (shedding, backlog full, host memory budget, the OOM signature behind nats IO error storms, DUPLICATES, vanished ephemeral consumers, KV ack timeouts, already-settled, ack-owned-by-host, limit-exceeded fetches, the Go timer trap). Use when a NATS component drops or duplicates messages, stops receiving with no error, reports nats IO error or disconnected, needs more throughput or a bigger payload, or before changing any capacity, ack, timeout, or poolSize setting. Triggers on NATS, JetStream, messages, nats.io and Synadia. Companion to cosmonic-nats (building the component) and cosmonic-sandbox (the deploy loop).
 license: Apache-2.0
 compatibility: Applies to components on the wasmcloud:nats@0.1.0 driver (Cosmonic Desktop, wasmCloud v2.8+, Cosmonic Control). Numbers were measured in the nats-2.8-testing campaign on a 512 Mi host with NATS 2.12 and JetStream; treat them as calibrated starting points and re-measure on the target host.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
   author: Cosmonic
   upstream: "cosmonic-labs/nats-2.8-testing templates/nats-tuning.md @ 5a437ac"
 ---
