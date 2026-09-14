@@ -24,6 +24,7 @@ hyper = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sha2 = { version = "0.10", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "sync", "time", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "std"] }
@@ -74,6 +75,10 @@ rmcp = { version = "3", default-features = false, features = [
     "schemars",
 ] }
 schemars = "1"
+
+# Skills over MCP: the manifest carries a SHA-256 digest of every served file
+# (ext-skills "Integrity and Verification").
+sha2 = { workspace = true }
 
 # HTTP/1 over the daemon's unix socket / named pipe. Deliberately NOT reqwest:
 # the link is a local socket, so a TLS stack would be pure weight in a binary

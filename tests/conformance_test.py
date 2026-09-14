@@ -21,11 +21,25 @@ the server answers whether or not cosmonicd is up.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 from pathlib import Path
+from typing import Any
 
+import mcp.types as types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from pydantic import TypeAdapter
+
+# The Skills extension (io.modelcontextprotocol/skills, MCP 2026-07-28).
+SKILLS_EXTENSION = "io.modelcontextprotocol/skills"
+RAW_RESULT = TypeAdapter(dict[str, Any])
+
+
+class UriParams(types.RequestParams):
+    """`{uri}` — the one parameter `skills/get` and `resources/directory/read` take."""
+
+    uri: str
 
 FAILURES: list[str] = []
 CHECKS = 0
@@ -137,6 +151,11 @@ async def main() -> int:
             resources = (await session.list_resources()).resources
             check("returns a non-empty resource list", len(resources) > 0,
                   f"{len(resources)} resources")
+            check("lists the playbooks but not their reference files",
+                  not any(str(r.uri).startswith("skill://") and "/references/" in str(r.uri)
+                          for r in resources))
+            # The catalog as a resource, for a client that reads resources but
+            # has no skills/list: listed.
             check("publishes the skill index",
                   any(str(r.uri) == "skill://index.json" for r in resources))
 
@@ -150,6 +169,88 @@ async def main() -> int:
             # A read that needs no daemon: the skill catalog is compiled in.
             index = await session.read_resource("skill://index.json")
             check("reads the skill index", bool(index.contents))
+
+            print("\n[ skills extension ]")
+            # The extension is declared on the handshake and on the stateless
+            # 2026-07-28 `server/discover` alike — a client issues the skills
+            # methods only after seeing it.
+            caps = init.capabilities.model_dump(by_alias=True)
+            ext = (caps.get("extensions") or {}).get(SKILLS_EXTENSION)
+            check("initialize declares the skills extension", isinstance(ext, dict), str(caps))
+            check("the extension declares directoryRead", (ext or {}).get("directoryRead") is True)
+            # What a Claude client actually reads: the catalog in instructions.
+            instructions = init.instructions or ""
+            discover = await session.send_discover("2026-07-28")
+            check("server/discover lists 2026-07-28",
+                  "2026-07-28" in (discover.get("supportedVersions") or []))
+            check("server/discover declares the skills extension",
+                  isinstance(((discover.get("capabilities") or {}).get("extensions") or {})
+                             .get(SKILLS_EXTENSION), dict))
+
+            listing = await session.send_request(
+                types.Request(method="skills/list", params={}), RAW_RESULT)
+            skills = listing.get("skills") or []
+            check("skills/list returns entries", len(skills) >= 5, f"{len(skills)} skills")
+            check("instructions carry every skill's name and trigger description",
+                  all(f"- {(sk.get('frontmatter') or {}).get('name')}: "
+                      f"{(sk.get('frontmatter') or {}).get('description')}" in instructions
+                      for sk in skills), instructions[:200])
+            check("instructions name the skill index resource", "skill://index.json" in instructions)
+            import json as _json
+            check("the skill index mirrors skills/list",
+                  _json.loads(index.contents[0].text).get("skills") == skills)
+            check("skills/list carries resultType, ttlMs and cacheScope",
+                  listing.get("resultType") == "complete"
+                  and isinstance(listing.get("ttlMs"), int)
+                  and listing.get("cacheScope") in ("public", "private"))
+            # Every entry: a SKILL.md URI whose last path segment is the
+            # frontmatter name, and a complete manifest whose digests and sizes
+            # describe exactly the bytes resources/read serves — the host's
+            # verification, run here.
+            bad_entries, bad_files, verified = [], [], 0
+            for skill in skills:
+                uri = skill.get("uri") or ""
+                fm = skill.get("frontmatter") or {}
+                manifest = skill.get("resources")
+                if not (uri.endswith("/SKILL.md") and isinstance(manifest, list)
+                        and uri.rsplit("/", 2)[-2] == fm.get("name") and fm.get("description")
+                        and any(f.get("uri") == uri for f in manifest)):
+                    bad_entries.append(uri)
+                    continue
+                for f in manifest:
+                    body = (await session.read_resource(f["uri"])).contents[0].text.encode("utf-8")
+                    if (f.get("size") != len(body)
+                            or f.get("digest") != "sha256:" + hashlib.sha256(body).hexdigest()):
+                        bad_files.append(f["uri"])
+                    verified += 1
+                one = await session.send_request(
+                    types.Request(method="skills/get", params=UriParams(uri=uri)), RAW_RESULT)
+                if one.get("skill") != skill or one.get("resultType") != "complete":
+                    bad_entries.append(uri + " (skills/get disagrees)")
+            check("every skill entry is well-formed and skills/get agrees",
+                  not bad_entries, str(bad_entries))
+            check(f"every manifest digest and size verifies ({verified} files)",
+                  not bad_files, str(bad_files))
+
+            root = await session.send_request(
+                types.Request(method="resources/directory/read",
+                              params=UriParams(uri=skills[0]["uri"].rsplit("/", 1)[0])),
+                RAW_RESULT)
+            children = root.get("resources") or []
+            check("resources/directory/read lists the skill root",
+                  any(c.get("name") == "SKILL.md" for c in children)
+                  and any(c.get("mimeType") == "inode/directory" for c in children),
+                  str(children)[:200])
+
+            try:
+                await session.send_request(
+                    types.Request(method="skills/get",
+                                  params=UriParams(uri="skill://does-not-exist/SKILL.md")),
+                    RAW_RESULT)
+                check("skills/get of an unknown skill is -32602", False, "it was accepted")
+            except Exception as err:  # noqa: BLE001
+                check("skills/get of an unknown skill is -32602",
+                      getattr(err, "code", None) == -32602, str(err)[:160])
 
             print("\n[ error quality ]")
             # The criteria reject generic errors. An unknown resource must say

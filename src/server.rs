@@ -20,12 +20,12 @@ use std::sync::{Arc, OnceLock};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, GetPromptRequestParams,
-    GetPromptResponse, GetPromptResult, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
-    ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CustomRequest,
+    CustomResult, ErrorCode, ExtensionCapabilities, GetPromptRequestParams, GetPromptResponse,
+    GetPromptResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
@@ -131,11 +131,10 @@ impl CosmonicMcp {
                 format!("Could not reach the Cosmonic daemon: {m}"),
                 "Start Cosmonic Desktop (or run `cosmonicd`) so the daemon's unix socket is available, then retry. Confirm with `cosmonic_host_status`.",
             ),
-            Err(DaemonError::Api { status, code, message }) => self.fail(
-                &code,
-                format!("{message} (HTTP {status})"),
-                recovery_for(&code, status),
-            ),
+            Err(DaemonError::Api { status, code, message }) => {
+                let (code, recovery) = refine(code, status, &message);
+                self.fail(&code, format!("{message} (HTTP {status})"), recovery)
+            }
             Err(DaemonError::Transport(m)) => self.fail(
                 "transport_error",
                 m,
@@ -145,18 +144,36 @@ impl CosmonicMcp {
     }
 }
 
-/// Recovery hint per daemon error code/status, scoped to the tool that called.
+/// The daemon's code + a recovery hint, with the one case the daemon leaves
+/// generic made specific here.
 ///
-/// `tool` matters because the generic arms used to misdirect: every 400 said
-/// "see the `cosmonic://schema/workload` resource", which is right only for
-/// `cosmonic_workload_apply` and was being attached to bad log levels, bad OCI
-/// refs and unknown template ids; every `not_found` said "List with
-/// `cosmonic_workload_list`", including when the missing thing was a project
-/// id (issue #501 R-4). The tool name comes from [`CURRENT_TOOL`], the
-/// task-local the dispatcher already sets.
-fn recovery_for(code: &str, status: u16) -> String {
+/// A Workload body that does not deserialize comes back as a 422 whose code
+/// is the bare `error` and whose message is serde's — `missing field
+/// \`components\`` when the caller pasted a `WorkloadDeployment` /
+/// `HTTPTrigger` (the `spec.template.spec` nesting) instead of a flat
+/// `Workload`. That is by far the most common way an apply or validate fails
+/// to parse, and "Inspect the error message; check the logs" is not a
+/// recovery for it. The code becomes `invalid_workload` (what a 400 from the
+/// same tools already says) and the hint names the flattening.
+fn refine(code: String, status: u16, message: &str) -> (String, String) {
     let tool = CURRENT_TOOL.try_with(|t| t.clone()).unwrap_or_default();
-    recovery_for_tool(code, status, &tool)
+    refine_for_tool(code, status, message, &tool)
+}
+
+fn refine_for_tool(code: String, status: u16, message: &str, tool: &str) -> (String, String) {
+    if status == 422 && subject_of(tool) == Subject::Workload {
+        let recovery = if message.contains("missing field `components`") {
+            "This is the nested `WorkloadDeployment` / `HTTPTrigger` shape. Apply a flat \
+             `Workload` with top-level `spec.components` and `spec.hostInterfaces` — the \
+             `cosmonic://schema/workload` resource has the shape and a worked example."
+                .to_string()
+        } else {
+            recovery_for_tool("invalid_workload", 400, tool)
+        };
+        return ("invalid_workload".to_string(), recovery);
+    }
+    let recovery = recovery_for_tool(&code, status, tool);
+    (code, recovery)
 }
 
 /// The subject a tool operates on, for wording a `not_found` or a 400.
@@ -183,12 +200,16 @@ fn subject_of(tool: &str) -> Subject {
         | "cosmonic_workload_delete"
         | "cosmonic_workload_apply"
         | "cosmonic_workload_list"
+        | "cosmonic_workload_validate"
+        | "cosmonic_workload_revision_list"
+        | "cosmonic_workload_rollback"
         | "cosmonic_workload_credentials_test" => Subject::Workload,
         "cosmonic_dev_start"
         | "cosmonic_dev_stop"
         | "cosmonic_dev_status"
         | "cosmonic_dev_logs"
         | "cosmonic_project_publish"
+        | "cosmonic_project_delete"
         | "cosmonic_project_list" => Subject::Project,
         "cosmonic_image_inspect" | "cosmonic_workload_draft" => Subject::Image,
         "cosmonic_project_create" => Subject::Template,
@@ -197,6 +218,15 @@ fn subject_of(tool: &str) -> Subject {
     }
 }
 
+/// Recovery hint per daemon error code/status, scoped to the tool that called.
+///
+/// `tool` matters because the generic arms used to misdirect: every 400 said
+/// "see the `cosmonic://schema/workload` resource", which is right only for
+/// `cosmonic_workload_apply` and was being attached to bad log levels, bad OCI
+/// refs and unknown template ids; every `not_found` said "List with
+/// `cosmonic_workload_list`", including when the missing thing was a project
+/// id (issue #501 R-4). [`refine`] supplies the tool name from
+/// [`CURRENT_TOOL`], the task-local the dispatcher already sets.
 fn recovery_for_tool(code: &str, status: u16, tool: &str) -> String {
     match (code, status) {
         ("invalid_path", _) => "Use lowercase DNS-label namespace/name (alnum + '-', <=63).".into(),
@@ -360,6 +390,67 @@ const FLAGGED_LIST_TTL_MS: u64 = 60 * 1000;
 /// answer to "what is true right now", and a cached one is a wrong one.
 const LIVE_READ_TTL_MS: u64 = 0;
 
+/// The server's identity, capabilities and instructions — what `initialize`
+/// returns to a handshake peer and `server/discover` to a stateless one.
+fn server_info() -> ServerInfo {
+    // ServerInfo is #[non_exhaustive]; mutate a default rather than a literal.
+    let mut info = ServerInfo::default();
+
+    // rmcp's default reports the SDK as the server (`{"name":"rmcp",
+    // "version":"<sdk version>"}`) — which is what a client shows the user
+    // as this server's identity, and what a directory listing captures
+    // (issue #501 R-1). Name the product, and track the daemon's version so
+    // a bug report says which build answered.
+    info.server_info.name = crate::SERVER_NAME.into();
+    info.server_info.version = crate::SERVER_VERSION.into();
+    // Skills over MCP (ext-skills): the extension is declared alongside
+    // `resources`, which it rides on — a server declaring it MUST declare
+    // both. The same capabilities answer `initialize` (handshake peers)
+    // and `server/discover` (stateless 2026-07-28 peers).
+    let mut extensions = ExtensionCapabilities::new();
+    extensions.insert(skills::EXTENSION_ID.to_string(), skills::capability());
+    info.capabilities = ServerCapabilities::builder()
+        .enable_extensions_with(extensions)
+        .enable_tools()
+        .enable_resources()
+        .enable_prompts()
+        .build();
+    // Descriptive, not procedural: what the server is, what it publishes and
+    // where, and the two facts a first Workload most often gets wrong. The
+    // playbooks carry the workflow; the Connectors Directory rejects
+    // instructions that script the model's tool sequence.
+    info.instructions = Some(instructions());
+    info
+}
+
+/// `initialize.instructions` / `server/discover.instructions`.
+///
+/// Server context for the model, in the declarative register the Connectors
+/// Directory review asks for: what this server is, the skill catalog, and the
+/// two defaults a first Workload most often gets wrong. It scripts no tool
+/// sequence; the playbooks do that.
+///
+/// The catalog is here on purpose. No Claude client calls `skills/list` yet;
+/// what it does see — in its system prompt, before the first tool call, and
+/// regardless of tool-search deferral — is this text. The working group's
+/// own Claude-tuned server does the same, and its experiments found it the
+/// one reliable channel. It also names the `skill://index.json` resource for
+/// clients that read resources but surface neither (`skills.rs` module docs,
+/// "Three channels, one catalog"). ~5 KB, once per session.
+fn instructions() -> String {
+    format!("{PREAMBLE}\n\n{}\n{POSTSCRIPT}", skills::catalog())
+}
+
+const PREAMBLE: &str = "Cosmonic Desktop: a local wasmCloud host that runs WebAssembly \
+    component workloads in a sandbox. The tools scaffold, build, publish, schedule and \
+    observe those workloads through the local daemon.";
+
+const POSTSCRIPT: &str = "The `cosmonic://schema/workload` resource documents the \
+    runtime.wasmcloud.dev/v1alpha1 Workload spec that cosmonic_workload_apply accepts, and \
+    `cosmonic://capabilities` what this host can run. A Workload's allowedHosts is deny-all \
+    until set; secrets are named references registered with cosmonic_secret_set, never \
+    inline values.";
+
 impl ServerHandler for CosmonicMcp {
     /// The MCP handshake — and the only place we learn WHICH agent is driving
     /// us. rmcp's default implementation just stores the peer info and returns
@@ -389,34 +480,7 @@ impl ServerHandler for CosmonicMcp {
     }
 
     fn get_info(&self) -> ServerInfo {
-        // ServerInfo is #[non_exhaustive]; mutate a default rather than a literal.
-        let mut info = ServerInfo::default();
-        // rmcp's default reports the SDK as the server (`{"name":"rmcp",
-        // "version":"<sdk version>"}`) — which is what a client shows the user
-        // as this server's identity, and what a directory listing captures
-        // (issue #501 R-1). Name the product, and track the daemon's version so
-        // a bug report says which build answered.
-        info.server_info.name = crate::SERVER_NAME.into();
-        info.server_info.version = crate::SERVER_VERSION.into();
-        info.capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_resources()
-            .enable_prompts()
-            .build();
-        info.instructions = Some(
-            "Cosmonic Desktop: scaffold, build, and deploy WebAssembly component workloads on \
-             the local wasmCloud host.\n\n\
-             This server publishes skills. Read `skill://index.json` for the catalog, then read \
-             the SKILL.md whose description matches the task — that playbook is the fastest path \
-             to a correct deploy, and it links reference files you only read if you need them.\n\n\
-             Without it: cosmonic_host_status -> cosmonic_template_list -> \
-             cosmonic_project_create -> (write the code with your own file tools) -> \
-             cosmonic_dev_start -> cosmonic_project_publish -> cosmonic_workload_apply, and read the \
-             `cosmonic://schema/workload` resource before authoring a Workload. allowedHosts is \
-             deny-all by default; secrets are references (cosmonic_secret_set), never inline values."
-                .into(),
-        );
-        info
+        server_info()
     }
 
     // ---- tools: delegate to the generated router ----------------------------
@@ -612,6 +676,26 @@ impl ServerHandler for CosmonicMcp {
         )
     }
 
+    // ---- skills over MCP (ext-skills): the three extension methods ----------
+    //
+    // rmcp has no first-class handler for an extension method, so the three the
+    // extension defines arrive here. `skills/list` and `skills/get` return
+    // `Skill` entries — frontmatter plus a digest manifest — and
+    // `resources/directory/read` the direct children of a directory resource.
+    // All three are static content compiled into the binary, so they carry the
+    // same freshness hint as `tools/list`. Every result is the 2026-07-28
+    // shape: `resultType: "complete"` plus `ttlMs` and `cacheScope`, which the
+    // extension makes REQUIRED on list and get.
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        let CustomRequest { method, params, .. } = request;
+        extension_method(&method, params.as_ref()).map(CustomResult::new)
+    }
+
     // ---- prompts ------------------------------------------------------------
 
     async fn list_prompts(
@@ -688,6 +772,67 @@ fn flag_is_enabled(response: &Value, key: &str) -> bool {
         .find(|f| f.get("key").and_then(|k| k.as_str()) == Some(key))
         .and_then(|f| f.get("enabled").and_then(|e| e.as_bool()))
         .unwrap_or(false)
+}
+
+/// Dispatch for the extension methods (`skills/list`, `skills/get`,
+/// `resources/directory/read`) — pure, so it is testable without a peer.
+///
+/// An unknown method gets the base protocol's `-32601`; a bad or unresolvable
+/// `uri` the `-32602` the extension prescribes.
+fn extension_method(method: &str, params: Option<&Value>) -> Result<Value, McpError> {
+    match method {
+        skills::LIST_METHOD => Ok(json!({
+            "resultType": "complete",
+            "skills": skills::entries(),
+            "ttlMs": STATIC_LIST_TTL_MS,
+            "cacheScope": "public",
+        })),
+        skills::GET_METHOD => {
+            let uri = uri_param(params, skills::GET_METHOD)?;
+            let entry = skills::entry(&uri).ok_or_else(|| {
+                McpError::invalid_params(format!("No skill is served at {uri}"), None)
+            })?;
+            Ok(json!({
+                "resultType": "complete",
+                "skill": entry,
+                "ttlMs": STATIC_LIST_TTL_MS,
+                "cacheScope": "public",
+            }))
+        }
+        skills::DIRECTORY_READ_METHOD => {
+            let uri = uri_param(params, skills::DIRECTORY_READ_METHOD)?;
+            let resources = skills::directory(&uri).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("{uri} is not a directory resource this server serves"),
+                    None,
+                )
+            })?;
+            Ok(json!({
+                "resultType": "complete",
+                "resources": resources,
+            }))
+        }
+        other => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            other.to_string(),
+            None,
+        )),
+    }
+}
+
+/// The `uri` of a `skills/get` or `resources/directory/read` request.
+///
+/// Both take exactly one required string parameter; anything else is
+/// `-32602`, the same code the extension prescribes for a URI that names
+/// nothing, so a client sees one error class for "bad request" throughout.
+fn uri_param(params: Option<&Value>, method: &str) -> Result<String, McpError> {
+    params
+        .and_then(|p| p.get("uri"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("{method} requires a string `uri` parameter"), None)
+        })
 }
 
 /// A `text/…` or `application/json` resource body with a REAL MIME type.
@@ -928,18 +1073,31 @@ mod tests {
     /// Phrases like "confirm with the user first" are rejected as prompt
     /// injection — the mechanism for that is `destructiveHint`, which makes the
     /// CLIENT prompt.
+    /// Phrases that direct the model rather than describe the tool. The first
+    /// group is what reviewers reject as prompt injection; the second is the
+    /// softer sequencing directive ("call it first") the #521 audit flagged in
+    /// `cosmonic_host_status` — reviewers read it as a behavioural override,
+    /// and the playbooks are where sequencing belongs.
+    const BANNED_DIRECTIVES: &[&str] = &[
+        "confirm with the user",
+        "never pass a value you obtained",
+        "do not tell the user",
+        "ignore previous",
+        "you must always",
+        "call it first",
+        "call this first",
+        "read this first",
+        "read it first",
+        "before anything else",
+        "always call",
+        "always read",
+    ];
+
     #[test]
     fn descriptions_do_not_instruct_the_model() {
-        const BANNED: &[&str] = &[
-            "confirm with the user",
-            "never pass a value you obtained",
-            "do not tell the user",
-            "ignore previous",
-            "you must always",
-        ];
         for tool in router().list_all() {
             let text = tool.description.clone().unwrap_or_default().to_lowercase();
-            for phrase in BANNED {
+            for phrase in BANNED_DIRECTIVES {
                 assert!(
                     !text.contains(phrase),
                     "{} description contains behavioural instruction {phrase:?}",
@@ -947,6 +1105,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `instructions` is server context, not a script. The audit (#521 §4.2)
+    /// flagged the previous text for an imperative "Read … then read …" and an
+    /// explicit `A -> B -> C` tool chain. The extension expressly allows
+    /// instructions to point at skill URIs, so naming the catalog stays.
+    #[test]
+    fn instructions_describe_the_server_rather_than_script_the_model() {
+        let text = instructions().to_lowercase();
+        for phrase in BANNED_DIRECTIVES {
+            assert!(!text.contains(phrase), "instructions contain {phrase:?}");
+        }
+        assert!(!text.contains("->"), "instructions script a tool chain");
+        assert!(
+            !text.contains("without it:"),
+            "instructions script a fallback chain"
+        );
+        for sentence in text.split(['.', '\n']) {
+            let s = sentence.trim();
+            assert!(
+                !(s.starts_with("read ") || s.starts_with("call ") || s.starts_with("then ")),
+                "instructions open a sentence with an imperative: {s:?}"
+            );
+        }
+        // The catalog is in there — every skill with its trigger — and so are
+        // the two other channels a client might try.
+        assert!(text.contains("skills/list"));
+        assert!(text.contains("skill://index.json"));
+        assert!(text.contains("cosmonic://schema/workload"));
+        for skill in skills::SKILLS {
+            assert!(
+                text.contains(&skill.description().to_lowercase()),
+                "{}",
+                skill.name
+            );
+        }
+        assert!(
+            text.len() < 8 * 1024,
+            "instructions are {} chars; the catalog is a page, not a book",
+            text.len()
+        );
+    }
+
+    /// The Connectors Directory rule for a freeform-input tool: the description
+    /// names or links the API the caller is authoring against. Both Workload
+    /// tools take an arbitrary CRD, so both link the public reference.
+    #[test]
+    fn freeform_workload_tools_link_the_public_schema_reference() {
+        for name in ["cosmonic_workload_apply", "cosmonic_workload_validate"] {
+            let tool = router()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name}"));
+            let text = tool.description.clone().unwrap_or_default();
+            assert!(
+                text.contains("https://cosmonic.com/docs/api-reference/runtime.wasmcloud.dev/"),
+                "{name}: description does not link the Workload reference"
+            );
+        }
+    }
+
+    // ---- skills over MCP: the extension on the wire ------------------------
+
+    /// A server declaring the extension MUST declare `resources` too, and the
+    /// capabilities answer both `initialize` and `server/discover`.
+    #[test]
+    fn the_skills_extension_is_declared_with_resources() {
+        let info = server_info();
+        let caps = serde_json::to_value(&info.capabilities).unwrap();
+        assert!(caps["resources"].is_object(), "{caps}");
+        let ext = &caps["extensions"][skills::EXTENSION_ID];
+        assert!(ext.is_object(), "extension not declared: {caps}");
+        assert_eq!(ext["directoryRead"], json!(true));
+    }
+
+    #[test]
+    fn skills_list_is_the_spec_result_shape() {
+        let result = extension_method(skills::LIST_METHOD, None).expect("lists");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["cacheScope"], "public");
+        assert_eq!(result["ttlMs"], json!(STATIC_LIST_TTL_MS));
+        assert!(
+            result.get("nextCursor").is_none(),
+            "one page, never paginated"
+        );
+        let listed = result["skills"].as_array().unwrap();
+        assert_eq!(listed.len(), skills::SKILLS.len());
+        for entry in listed {
+            for key in ["uri", "frontmatter", "resources"] {
+                assert!(entry.get(key).is_some(), "entry lacks {key}: {entry}");
+            }
+            assert!(entry["frontmatter"]["name"].is_string());
+            assert!(entry["frontmatter"]["description"].is_string());
+        }
+        // The whole listing is a session-start read; keep it that size.
+        assert!(result.to_string().len() < 24 * 1024);
+    }
+
+    #[test]
+    fn skills_get_returns_the_listed_entry_or_invalid_params() {
+        let listed = extension_method(skills::LIST_METHOD, None).unwrap();
+        for entry in listed["skills"].as_array().unwrap() {
+            let uri = entry["uri"].as_str().unwrap();
+            let got = extension_method(skills::GET_METHOD, Some(&json!({ "uri": uri }))).unwrap();
+            assert_eq!(got["resultType"], "complete");
+            assert_eq!(got["cacheScope"], "public");
+            assert_eq!(got["ttlMs"], json!(STATIC_LIST_TTL_MS));
+            assert_eq!(&got["skill"], entry, "get disagrees with list for {uri}");
+        }
+        for params in [
+            json!({ "uri": "skill://nope/SKILL.md" }),
+            json!({ "uri": "skill://cosmonic-sandbox" }),
+            json!({ "uri": "skill://cosmonic-sandbox/references/recipes.md" }),
+            json!({ "uri": 7 }),
+            json!({}),
+        ] {
+            let err = extension_method(skills::GET_METHOD, Some(&params)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{params}: {err:?}");
+        }
+        let err = extension_method(skills::GET_METHOD, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn directory_read_answers_directories_and_refuses_the_rest() {
+        let root = extension_method(
+            skills::DIRECTORY_READ_METHOD,
+            Some(&json!({ "uri": "skill://cosmonic-sandbox" })),
+        )
+        .unwrap();
+        assert_eq!(root["resultType"], "complete");
+        let children = root["resources"].as_array().unwrap();
+        assert!(children.iter().any(|r| r["name"] == "SKILL.md"));
+        assert!(children
+            .iter()
+            .any(|r| r["name"] == "references" && r["mimeType"] == skills::DIRECTORY_MIME));
+        for uri in [
+            "skill://cosmonic-sandbox/SKILL.md",
+            "skill://cosmonic-sandbox/",
+            "skill://nope",
+            "cosmonic://host",
+        ] {
+            let err = extension_method(skills::DIRECTORY_READ_METHOD, Some(&json!({ "uri": uri })))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{uri}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_custom_method_is_method_not_found() {
+        let err = extension_method("skills/delete", None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
+        let err = extension_method("nope/nothing", Some(&json!({}))).unwrap_err();
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
     }
 
     /// A read-only tool must not be able to change anything, and the clearest
@@ -1248,6 +1560,52 @@ mod tests {
         // The Workload schema hint survives where it is actually right.
         let apply = recovery_for_tool("invalid_workload", 400, "cosmonic_workload_apply");
         assert!(apply.contains("cosmonic://schema/workload"), "{apply}");
+    }
+
+    #[test]
+    fn a_nested_workload_deployment_gets_the_flattening_hint() {
+        // The daemon answers a serde failure with a 422 and the bare code
+        // `error`; the MCP layer is where it becomes actionable.
+        let serde = "Failed to deserialize the JSON body into the target type: spec: missing field `components` at line 1 column 60";
+        for tool in ["cosmonic_workload_apply", "cosmonic_workload_validate"] {
+            let (code, hint) = refine_for_tool("error".into(), 422, serde, tool);
+            assert_eq!(code, "invalid_workload", "{tool}");
+            assert!(hint.contains("flat `Workload`"), "{tool}: {hint}");
+            assert!(hint.contains("spec.components"), "{tool}: {hint}");
+        }
+        // Any other 422 from a workload tool still gets the schema hint...
+        let (code, hint) = refine_for_tool(
+            "error".into(),
+            422,
+            "unknown field `foo`",
+            "cosmonic_workload_apply",
+        );
+        assert_eq!(code, "invalid_workload");
+        assert!(hint.contains("cosmonic://schema/workload"), "{hint}");
+        // ...and a 422 elsewhere is left exactly as the daemon said it.
+        let (code, hint) = refine_for_tool("error".into(), 422, serde, "cosmonic_project_create");
+        assert_eq!(code, "error");
+        assert!(!hint.contains("flat `Workload`"), "{hint}");
+    }
+
+    #[test]
+    fn the_newer_workload_and_project_tools_are_classified() {
+        // Added in #503 after subject_of was written; they were falling to
+        // Subject::Other, so revision_list's not_found named no list tool.
+        for tool in [
+            "cosmonic_workload_validate",
+            "cosmonic_workload_revision_list",
+            "cosmonic_workload_rollback",
+        ] {
+            assert!(
+                recovery_for_tool("not_found", 404, tool).contains("cosmonic_workload_list"),
+                "{tool}"
+            );
+        }
+        assert!(
+            recovery_for_tool("not_found", 404, "cosmonic_project_delete")
+                .contains("cosmonic_project_list")
+        );
     }
 
     #[test]
