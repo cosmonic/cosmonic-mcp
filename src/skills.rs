@@ -41,10 +41,10 @@
 //!
 //! Discovery is three tiers, and the gap between them is the entire point:
 //!
-//! 1. The catalog — `skills/list`, or for a client without the extension the
-//!    [`INDEX_URI`] resource (`skill://index.json`), which carries the same
-//!    entries — read once at session start: names plus the trigger
-//!    descriptions a client matches requests against. A few KB.
+//! 1. The catalog — `skills/list` for a client with the extension; for one
+//!    without it (every Claude surface as of this writing) the same names and
+//!    trigger descriptions arrive in `instructions` at `initialize`
+//!    ([`catalog`]), which a host puts in the system prompt. A few KB, once.
 //! 2. Only when a request matches does it read `skill://<name>/SKILL.md` —
 //!    the playbook, tens of KB.
 //! 3. Relative paths inside a `SKILL.md` resolve against the skill root, so
@@ -54,15 +54,22 @@
 //! Reading all five playbooks and every reference would be ~300 KB. Reading
 //! the catalog is a few KB.
 //!
-//! ## The legacy catalog
+//! ## Why the catalog rides in `instructions`
 //!
-//! [`INDEX_URI`] predates the extension and stays for clients that have not
-//! adopted it (as of this writing that is every Claude surface — see the MCP
-//! client matrix). It is a *mirror* of `skills/list`, not a second catalog:
-//! its `skills` array is the same entries, so there is exactly one shape for a
-//! skill on this server. A client with the extension never needs it, and the
-//! spec is explicit that `skill://` resources are ordinary resources to a
-//! client without one.
+//! No Claude client calls `skills/list` yet, and none of the official SDKs
+//! implement it (typescript-sdk #2798, python-sdk #3486 are open). What a
+//! Claude client does see, before its first tool call and regardless of
+//! tool-search deferral, is the server's `instructions`. That is the channel
+//! the working group's own Claude-tuned server (skilljack-mcp) uses, and the
+//! one its experiments found reliable ("a single server instruction changed
+//! the loading order"). So [`catalog`] renders the same names and descriptions
+//! `skills/list` carries, declaratively, for `server.rs` to append.
+//!
+//! `skill://index.json` — the pre-v1 draft convention this server started
+//! with — is **deprecated**: still readable for one release so an installed
+//! 0.5.28 skill text or LM Studio preset that names it does not break, but
+//! unlisted, unmentioned, and gone next minor. The reference server (Hugging
+//! Face) has already removed its equivalent.
 //!
 //! ## Why `include_str!`
 //!
@@ -116,8 +123,8 @@ pub const DIRECTORY_MIME: &str = "inode/directory";
 /// The `_meta` key prefix reserved for skill resources by the extension.
 const META_PREFIX: &str = "io.modelcontextprotocol.skills/";
 
-/// URI of the legacy skill catalog — a mirror of `skills/list` for clients
-/// without the extension. See the module docs.
+/// URI of the DEPRECATED pre-extension catalog. Readable for one release,
+/// never listed or named. See the module docs.
 pub const INDEX_URI: &str = "skill://index.json";
 
 /// Scheme prefix for every skill resource URI.
@@ -410,27 +417,44 @@ pub fn entry(uri: &str) -> Option<&'static Value> {
     SKILLS.iter().find(|s| s.name == name).map(Skill::entry)
 }
 
-/// The legacy catalog served at [`INDEX_URI`] — the same entries
-/// `skills/list` returns, wrapped for a client that reads it as a resource.
+/// The catalog as text for `instructions` — what a client without the
+/// extension sees, in its system prompt, before its first tool call.
 ///
-/// Built from [`SKILLS`] on every read rather than stored, so it cannot fall
-/// out of step with the embedded files.
+/// Declarative: one line per skill, its name and its verbatim trigger
+/// description, prefaced by where the playbook lives. No "read this first":
+/// the description is what a model matches a task against, and the Connectors
+/// Directory review rejects sequencing directives.
+pub fn catalog() -> String {
+    let mut out = String::from(
+        "Skills this server publishes (io.modelcontextprotocol/skills: `skills/list` and \
+         `skills/get`; each playbook is the `skill://<name>/SKILL.md` resource and names its \
+         supporting files relative to that root):\n",
+    );
+    for skill in SKILLS {
+        out.push_str("- ");
+        out.push_str(skill.name);
+        out.push_str(": ");
+        out.push_str(skill.description());
+        out.push('\n');
+    }
+    out
+}
+
+/// The DEPRECATED catalog at [`INDEX_URI`]: the same entries `skills/list`
+/// returns, for an installed skill text or preset that still names the URI.
+/// Says so in the payload, and goes away next minor.
 pub fn index_json() -> String {
     let index = json!({
         "schemaVersion": "2",
+        "deprecated": "skill://index.json is the pre-extension catalog and will be removed; \
+                       the same entries are the `skills/list` result (io.modelcontextprotocol/skills), \
+                       and the names and descriptions are in the server's `instructions`.",
         "extension": EXTENSION_ID,
         "server": {
             "name": "cosmonic-desktop",
             "version": env!("CARGO_PKG_VERSION"),
             "skillsVersion": SKILLS_VERSION,
         },
-        "usage": "A mirror of this server's `skills/list` for clients without the \
-                  io.modelcontextprotocol/skills extension. Each entry is one skill: its \
-                  SKILL.md `uri`, its `frontmatter` (the `description` is what a task is \
-                  matched against), and `resources` — every file of the skill with its \
-                  SHA-256 digest and size. A playbook names its supporting files by path \
-                  relative to the skill root (for example `references/recipes.md`); that \
-                  file is skill://<skill>/<that path>, and every such URI is in `resources`.",
         "skills": entries(),
     });
     // Built from &'static str and owned values, so serialization cannot fail —
@@ -438,8 +462,8 @@ pub fn index_json() -> String {
     serde_json::to_string_pretty(&index).unwrap_or_else(|_| String::from(r#"{"skills":[]}"#))
 }
 
-/// The skill resources for `resources/list`: the legacy catalog and one
-/// `SKILL.md` per skill, with the metadata the extension prescribes for it —
+/// The skill resources for `resources/list`: one `SKILL.md` per skill, with
+/// the metadata the extension prescribes for it —
 /// `name` and `description` from the frontmatter, `text/markdown`, and the
 /// remaining frontmatter fields under the reserved `_meta` prefix.
 ///
@@ -449,16 +473,7 @@ pub fn index_json() -> String {
 /// URI; listing all of them here buried the five playbooks in twenty-odd
 /// reference files and gave a client nothing it did not already have.
 pub fn resources() -> Vec<Resource> {
-    let mut out = vec![Resource::new(INDEX_URI, "skill-index")
-        .with_title("Skill catalog")
-        .with_description(
-            "The skills this server publishes — the same entries as `skills/list`, for a \
-             client without the io.modelcontextprotocol/skills extension: each skill's \
-             SKILL.md URI, its frontmatter (name and trigger description), and its file \
-             manifest with SHA-256 digests.",
-        )
-        .with_mime_type("application/json")];
-
+    let mut out = Vec::with_capacity(SKILLS.len());
     for skill in SKILLS {
         let mut meta = JsonObject::new();
         for (key, value) in skill.frontmatter() {
@@ -486,8 +501,8 @@ pub fn resource_templates() -> Vec<ResourceTemplate> {
         ResourceTemplate::new("skill://{skill}/SKILL.md", "skill-playbook")
             .with_title("Skill playbook")
             .with_description(
-                "The SKILL.md of a named skill. Skill names come from skills/list (or the \
-                 skill://index.json catalog).",
+                "The SKILL.md of a named skill. Skill names come from skills/list, and from \
+                 the catalog in this server's instructions.",
             )
             .with_mime_type("text/markdown"),
         ResourceTemplate::new("skill://{skill}/{+path}", "skill-file")
@@ -863,42 +878,48 @@ mod tests {
         assert_eq!(cap.get("directoryRead"), Some(&Value::Bool(true)));
     }
 
-    // ---- the legacy catalog --------------------------------------------
+    // ---- the catalog in `instructions` -----------------------------------
 
     #[test]
-    fn the_index_is_small_enough_to_read_at_session_start() {
-        // The whole point of progressive disclosure: the catalog is read on
-        // EVERY session, the playbooks only on a match. If the index ever
-        // approaches the size of the bodies it indexes, the tiering is gone.
-        let index = index_json();
+    fn the_catalog_names_every_skill_with_its_trigger() {
+        // This is what a Claude client sees, in its system prompt, before its
+        // first tool call — so every skill and its WHOLE description must be
+        // there, and it must stay a fraction of the playbooks it indexes.
+        let text = catalog();
+        for skill in SKILLS {
+            assert!(
+                text.contains(&format!("- {}: {}", skill.name, skill.description())),
+                "{}: catalog lacks the name+description line",
+                skill.name
+            );
+        }
         let bodies: usize = SKILLS.iter().map(Skill::total_bytes).sum();
+        assert!(text.len() < 8 * 1024, "catalog is {} bytes", text.len());
         assert!(
-            index.len() < 24 * 1024,
-            "skill index is {} bytes; keep it readable at session start",
-            index.len()
+            text.len() * 8 < bodies,
+            "catalog is not much cheaper than the playbooks"
         );
-        assert!(
-            index.len() * 8 < bodies,
-            "index ({}) is not much cheaper than reading everything ({bodies})",
-            index.len()
-        );
+        assert!(text.contains("skills/list") && text.contains("skill://<name>/SKILL.md"));
     }
 
     #[test]
-    fn the_index_mirrors_skills_list() {
-        // One shape for a skill on this server: a client that reads the
-        // catalog as a resource sees exactly what skills/list returns.
+    fn the_deprecated_index_still_reads_but_is_not_listed() {
+        // One release of grace for an installed skill text or preset that
+        // names skill://index.json; it says so, mirrors skills/list, and is
+        // advertised nowhere.
         let index: Value = serde_json::from_str(&index_json()).expect("index is JSON");
-        assert_eq!(index["extension"], Value::from(EXTENSION_ID));
+        assert!(index["deprecated"]
+            .as_str()
+            .is_some_and(|d| d.contains("skills/list")));
         assert_eq!(index["skills"], Value::Array(entries()));
-        for entry in index["skills"].as_array().unwrap() {
-            let uri = entry["uri"].as_str().unwrap();
-            assert!(read(uri).is_some(), "index advertises unreadable {uri}");
-            for file in entry["resources"].as_array().unwrap() {
-                let uri = file["uri"].as_str().unwrap();
-                assert!(read(uri).is_some(), "index advertises unreadable {uri}");
-            }
-        }
+        assert!(
+            resources().iter().all(|r| r.uri != INDEX_URI),
+            "index is listed"
+        );
+        assert!(
+            !catalog().contains(INDEX_URI),
+            "catalog names the deprecated index"
+        );
     }
 
     // ---- resources/list ------------------------------------------------
@@ -906,11 +927,11 @@ mod tests {
     #[test]
     fn every_listed_resource_reads_and_carries_the_prescribed_metadata() {
         let listed = resources();
-        // The catalog + one playbook per skill — and nothing else. Supporting
-        // files are the manifest's job.
+        // One playbook per skill — and nothing else. Supporting files are the
+        // manifest's job; the catalog is `instructions`.
         assert_eq!(
             listed.len(),
-            SKILLS.len() + 1,
+            SKILLS.len(),
             "resources() lists more than the playbooks"
         );
         for resource in &listed {

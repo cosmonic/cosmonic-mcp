@@ -151,11 +151,13 @@ async def main() -> int:
             resources = (await session.list_resources()).resources
             check("returns a non-empty resource list", len(resources) > 0,
                   f"{len(resources)} resources")
-            check("publishes the skill index",
-                  any(str(r.uri) == "skill://index.json" for r in resources))
             check("lists the playbooks but not their reference files",
                   not any(str(r.uri).startswith("skill://") and "/references/" in str(r.uri)
                           for r in resources))
+            # The pre-extension catalog is deprecated: unlisted, still readable
+            # for one release so an installed skill text naming it does not break.
+            check("does not list the deprecated skill index",
+                  not any(str(r.uri) == "skill://index.json" for r in resources))
 
             templates = (await session.list_resource_templates()).resource_templates
             check("returns resource templates", len(templates) > 0)
@@ -164,9 +166,11 @@ async def main() -> int:
             check("returns a non-empty prompt list", len(prompts) > 0,
                   f"{len(prompts)} prompts")
 
-            # A read that needs no daemon: the skill catalog is compiled in.
+            # A read that needs no daemon: the deprecated catalog is compiled in
+            # and says what replaced it.
             index = await session.read_resource("skill://index.json")
-            check("reads the skill index", bool(index.contents))
+            check("the deprecated skill index still reads and says so",
+                  bool(index.contents) and "skills/list" in (index.contents[0].text or ""))
 
             print("\n[ skills extension ]")
             # The extension is declared on the handshake and on the stateless
@@ -176,6 +180,8 @@ async def main() -> int:
             ext = (caps.get("extensions") or {}).get(SKILLS_EXTENSION)
             check("initialize declares the skills extension", isinstance(ext, dict), str(caps))
             check("the extension declares directoryRead", (ext or {}).get("directoryRead") is True)
+            # What a Claude client actually reads: the catalog in instructions.
+            instructions = init.instructions or ""
             discover = await session.send_discover("2026-07-28")
             check("server/discover lists 2026-07-28",
                   "2026-07-28" in (discover.get("supportedVersions") or []))
@@ -187,6 +193,10 @@ async def main() -> int:
                 types.Request(method="skills/list", params={}), RAW_RESULT)
             skills = listing.get("skills") or []
             check("skills/list returns entries", len(skills) >= 5, f"{len(skills)} skills")
+            check("instructions carry every skill's name and trigger description",
+                  all(f"- {(sk.get('frontmatter') or {}).get('name')}: "
+                      f"{(sk.get('frontmatter') or {}).get('description')}" in instructions
+                      for sk in skills), instructions[:200])
             check("skills/list carries resultType, ttlMs and cacheScope",
                   listing.get("resultType") == "complete"
                   and isinstance(listing.get("ttlMs"), int)

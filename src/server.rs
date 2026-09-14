@@ -419,30 +419,35 @@ fn server_info() -> ServerInfo {
     // where, and the two facts a first Workload most often gets wrong. The
     // playbooks carry the workflow; the Connectors Directory rejects
     // instructions that script the model's tool sequence.
-    info.instructions = Some(INSTRUCTIONS.into());
+    info.instructions = Some(instructions());
     info
 }
 
 /// `initialize.instructions` / `server/discover.instructions`.
 ///
 /// Server context for the model, in the declarative register the Connectors
-/// Directory review asks for: what this server is, what it publishes and
-/// where, and the two defaults a first Workload most often gets wrong. It
-/// names the skill catalog — the extension expressly allows instructions to
-/// point at skill URIs — but scripts no tool sequence; the playbooks do that.
-const INSTRUCTIONS: &str = "Cosmonic Desktop: a local wasmCloud host that runs WebAssembly \
+/// Directory review asks for: what this server is, the skill catalog, and the
+/// two defaults a first Workload most often gets wrong. It scripts no tool
+/// sequence; the playbooks do that.
+///
+/// The catalog is here on purpose. No Claude client calls `skills/list` yet;
+/// what it does see — in its system prompt, before the first tool call, and
+/// regardless of tool-search deferral — is this text. The working group's
+/// own Claude-tuned server does the same, and its experiments found it the
+/// one reliable channel (`skills.rs` module docs). ~5 KB, once per session.
+fn instructions() -> String {
+    format!("{PREAMBLE}\n\n{}\n{POSTSCRIPT}", skills::catalog())
+}
+
+const PREAMBLE: &str = "Cosmonic Desktop: a local wasmCloud host that runs WebAssembly \
     component workloads in a sandbox. The tools scaffold, build, publish, schedule and \
-    observe those workloads through the local daemon.\n\n\
-    This server publishes the cosmonic-sandbox skill family over the \
-    io.modelcontextprotocol/skills extension (`skills/list`, `skills/get`; supporting files \
-    via `resources/read`). For a client without the extension, the same catalog is the \
-    `skill://index.json` resource and each playbook is `skill://<name>/SKILL.md`. The \
-    cosmonic-sandbox playbook covers the build-and-deploy loop; cosmonic-go, cosmonic-nats, \
-    cosmonic-nats-tuning and cosmonic-kafka cover their toolchain or transport.\n\n\
-    The `cosmonic://schema/workload` resource documents the runtime.wasmcloud.dev/v1alpha1 \
-    Workload spec that cosmonic_workload_apply accepts, and `cosmonic://capabilities` what \
-    this host can run. A Workload's allowedHosts is deny-all until set; secrets are named \
-    references registered with cosmonic_secret_set, never inline values.";
+    observe those workloads through the local daemon.";
+
+const POSTSCRIPT: &str = "The `cosmonic://schema/workload` resource documents the \
+    runtime.wasmcloud.dev/v1alpha1 Workload spec that cosmonic_workload_apply accepts, and \
+    `cosmonic://capabilities` what this host can run. A Workload's allowedHosts is deny-all \
+    until set; secrets are named references registered with cosmonic_secret_set, never \
+    inline values.";
 
 impl ServerHandler for CosmonicMcp {
     /// The MCP handshake — and the only place we learn WHICH agent is driving
@@ -1106,7 +1111,7 @@ mod tests {
     /// instructions to point at skill URIs, so naming the catalog stays.
     #[test]
     fn instructions_describe_the_server_rather_than_script_the_model() {
-        let text = INSTRUCTIONS.to_lowercase();
+        let text = instructions().to_lowercase();
         for phrase in BANNED_DIRECTIVES {
             assert!(!text.contains(phrase), "instructions contain {phrase:?}");
         }
@@ -1122,13 +1127,21 @@ mod tests {
                 "instructions open a sentence with an imperative: {s:?}"
             );
         }
-        // The pointers the model needs are still there.
+        // The catalog is in there — every skill with its trigger — and the
+        // deprecated index is not.
         assert!(text.contains("skills/list"));
-        assert!(text.contains("skill://index.json"));
+        assert!(!text.contains("skill://index.json"));
         assert!(text.contains("cosmonic://schema/workload"));
+        for skill in skills::SKILLS {
+            assert!(
+                text.contains(&skill.description().to_lowercase()),
+                "{}",
+                skill.name
+            );
+        }
         assert!(
-            text.len() < 1500,
-            "instructions are {} chars; keep them a paragraph",
+            text.len() < 8 * 1024,
+            "instructions are {} chars; the catalog is a page, not a book",
             text.len()
         );
     }
