@@ -84,25 +84,38 @@ that manifest is what deploys it.
 ## Skills over MCP
 
 The tools are the hands; a **skill** is the manual. This server publishes the
-`cosmonic-sandbox` skill family as `skill://` resources
-(`io.modelcontextprotocol/skills`), so **connecting is enough** — an agent
-gets the playbook without installing anything, including agents with no
-skills directory at all.
+`cosmonic-sandbox` skill family through the MCP Skills extension
+(`io.modelcontextprotocol/skills`, MCP 2026-07-28 —
+[ext-skills](https://github.com/modelcontextprotocol/ext-skills)), so
+**connecting is enough** — an agent gets the playbook without installing
+anything, including agents with no skills directory at all.
+
+Five skills, published flat: `cosmonic-sandbox`, `cosmonic-go`,
+`cosmonic-nats`, `cosmonic-nats-tuning`, `cosmonic-kafka`.
+
+| Method | Returns |
+|---|---|
+| `skills/list` | One `Skill` entry per skill: `uri`, verbatim `frontmatter`, and a complete `resources` manifest with a `sha256:` digest and byte `size` per file |
+| `skills/get` `{uri}` | The same entry for one `SKILL.md` URI; `-32602` otherwise |
+| `resources/read` | Any file in a manifest, `skill://<name>/<path>` |
+| `resources/directory/read` `{uri}` | Direct children of a directory (`directoryRead: true` is declared) |
 
 Disclosure is progressive:
 
-| Tier | URI | Size | Read when |
+| Tier | What | Size | Read when |
 |---|---|---|---|
-| 1 | `skill://index.json` | ~8 KB | Once, at session start |
-| 2 | `skill://<name>/SKILL.md` | 14–25 KB | The catalog description matches the task |
+| 1 | `skills/list` (or, without the extension, `skill://index.json` — the same entries) | ~10 KB | Once, at session start |
+| 2 | `skill://<name>/SKILL.md` | 14–25 KB | The entry's description matches the task |
 | 3 | `skill://<name>/references/<file>.md` | 3–26 KB | The playbook points at it |
 
-Reading everything is 269 KB; reading the index is 8 KB. That gap is the point.
+Reading everything is ~300 KB; reading the catalog is ~10 KB. That gap is the point.
 
 Skill content is embedded at compile time, so the binary is self-contained,
 works air-gapped, and cannot ship a playbook documenting a tool it does not
-have. `skills::read` resolves a URI by matching it **verbatim** against a
-static table — no filesystem, so no path traversal.
+have. Every lookup matches a URI **verbatim** against a static table — no
+filesystem, so no path traversal — and the manifest digests are computed from
+the same embedded bytes `resources/read` serves. The upstream MCP Inspector's
+`--method skills/list --verify` (the SEP-2640 conformance run) passes clean.
 
 ## Resources
 
@@ -110,7 +123,7 @@ static table — no filesystem, so no path traversal.
   spec plus a worked HTTP-API example. Read it before authoring a workload.
 - `cosmonic://host`, `cosmonic://workloads`, `cosmonic://templates` — live
   state, fetched at read time.
-- `skill://…` — see above.
+- `skill://index.json`, `skill://<name>/SKILL.md` — see above.
 
 ## Environment
 
@@ -123,7 +136,7 @@ static table — no filesystem, so no path traversal.
 ## Security
 
 - **No new network surface** — stdio to the client, a local socket to the daemon.
-- **Secrets stay references.** `cosmonic_secret_set` registers a reference (OS keychain, `env://`, 1Password, AWS Secrets Manager);
+- **Secrets stay references.** `cosmonic_set_secret` writes to the OS keychain;
   values are never returned, logged, or included in an error. A workload whose
   `secretFrom` ref is missing is accepted and parked, and the result tells the
   agent what is missing and that the *user* enters it in Cosmonic Desktop.
@@ -139,24 +152,11 @@ static table — no filesystem, so no path traversal.
 
 ```console
 $ cargo build --release --bin cosmonic-mcp
-$ cargo test
 ```
-
-This is a self-contained workspace: the server, plus the `cosmonic-api` wire
-types it speaks, vendored under `crates/`. Nothing else is needed to build it.
 
 No `cosmonic-host` dependency, by design: that would pull the whole
 wash-runtime/wasmtime build into a binary meant to stay small enough to ship
-inside an [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) — the
-bundle is built in
-[`cosmonic/claude-mcpb`](https://github.com/cosmonic/claude-mcpb).
-
-Source is synced from the monorepo where it is developed:
-
-```console
-$ ./scripts/sync-from-desktop.sh ../desktop
-$ ./scripts/sync-from-desktop.sh ../desktop --check   # CI: fail on drift
-```
+inside an [MCP Bundle](https://github.com/modelcontextprotocol/mcpb).
 
 ## License
 
