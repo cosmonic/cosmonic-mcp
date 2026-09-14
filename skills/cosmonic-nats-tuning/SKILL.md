@@ -4,7 +4,7 @@ description: Size and debug a wasmcloud:nats workload on Cosmonic Desktop from m
 license: Apache-2.0
 compatibility: Applies to components on the wasmcloud:nats@0.1.0 driver (Cosmonic Desktop, wasmCloud v2.8+, Cosmonic Control). Numbers were measured in the nats-2.8-testing campaign on a 512 Mi host with NATS 2.12 and JetStream; treat them as calibrated starting points and re-measure on the target host.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: Cosmonic
   upstream: "cosmonic-labs/nats-2.8-testing templates/nats-tuning.md @ 5a437ac"
 ---

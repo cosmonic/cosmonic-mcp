@@ -106,6 +106,14 @@ pub struct HostInfo {
     /// `GET /v1/nats` (daemon/docs/NATS.md). Absent on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nats: Option<String>,
+    /// The `cosmonic:kafka` defaults the host was built with, as a label:
+    /// `default broker` when kafka.yaml sets one for the unnamed binding (a
+    /// workload may override it), else `no default broker`, then `, bindings:
+    /// a,b` for the named bindings it has defaults for; or `not in this build`
+    /// for a daemon built without the Kafka plugin — never an address or a
+    /// credential (daemon/docs/KAFKA.md). Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kafka: Option<String>,
 
     /// Count of workloads currently observed `Failed` (crash-looped or failed
     /// to start), across the spec-store + ephemeral-dev workloads the
@@ -2702,10 +2710,12 @@ mod wire_tests {
             system_memory_free: Some(4 << 30),
             messaging: Some("in-memory".into()),
             nats: Some("nats://127.0.0.1:4222 (allow)".into()),
+            kafka: Some("default broker, bindings: orders".into()),
             failed_workloads: Some(1),
             labels: BTreeMap::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["kafka"], "default broker, bindings: orders");
         for key in [
             "friendlyName",
             "uptimeSecs",
