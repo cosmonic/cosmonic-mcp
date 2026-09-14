@@ -154,10 +154,10 @@ async def main() -> int:
             check("lists the playbooks but not their reference files",
                   not any(str(r.uri).startswith("skill://") and "/references/" in str(r.uri)
                           for r in resources))
-            # The pre-extension catalog is deprecated: unlisted, still readable
-            # for one release so an installed skill text naming it does not break.
-            check("does not list the deprecated skill index",
-                  not any(str(r.uri) == "skill://index.json" for r in resources))
+            # The catalog as a resource, for a client that reads resources but
+            # has no skills/list: listed.
+            check("publishes the skill index",
+                  any(str(r.uri) == "skill://index.json" for r in resources))
 
             templates = (await session.list_resource_templates()).resource_templates
             check("returns resource templates", len(templates) > 0)
@@ -166,11 +166,9 @@ async def main() -> int:
             check("returns a non-empty prompt list", len(prompts) > 0,
                   f"{len(prompts)} prompts")
 
-            # A read that needs no daemon: the deprecated catalog is compiled in
-            # and says what replaced it.
+            # A read that needs no daemon: the skill catalog is compiled in.
             index = await session.read_resource("skill://index.json")
-            check("the deprecated skill index still reads and says so",
-                  bool(index.contents) and "skills/list" in (index.contents[0].text or ""))
+            check("reads the skill index", bool(index.contents))
 
             print("\n[ skills extension ]")
             # The extension is declared on the handshake and on the stateless
@@ -197,6 +195,10 @@ async def main() -> int:
                   all(f"- {(sk.get('frontmatter') or {}).get('name')}: "
                       f"{(sk.get('frontmatter') or {}).get('description')}" in instructions
                       for sk in skills), instructions[:200])
+            check("instructions name the skill index resource", "skill://index.json" in instructions)
+            import json as _json
+            check("the skill index mirrors skills/list",
+                  _json.loads(index.contents[0].text).get("skills") == skills)
             check("skills/list carries resultType, ttlMs and cacheScope",
                   listing.get("resultType") == "complete"
                   and isinstance(listing.get("ttlMs"), int)

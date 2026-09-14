@@ -104,13 +104,13 @@ Disclosure is progressive:
 
 | Tier | What | Size | Read when |
 |---|---|---|---|
-| 1 | `skills/list` — or, without the extension, the same names + triggers in `instructions` (what a Claude client reads) | ~6 KB | Once, at session start |
+| 1 | `skills/list` — or, without the extension, the same catalog in `instructions` (what a Claude client reads) or the `skill://index.json` resource | ~6 KB | Once, at session start |
 | 2 | `skill://<name>/SKILL.md` | 14–25 KB | The entry's description matches the task |
 | 3 | `skill://<name>/references/<file>.md` | 3–26 KB | The playbook points at it |
 
 Reading everything is ~300 KB; the catalog is ~6 KB. That gap is the point.
-`skill://index.json` (the pre-extension catalog) is deprecated: readable one
-more release, never listed.
+Three channels, one catalog: `skills/list`, `instructions`, `skill://index.json` —
+all generated from the same entries.
 
 Skill content is embedded at compile time, so the binary is self-contained,
 works air-gapped, and cannot ship a playbook documenting a tool it does not
@@ -125,7 +125,7 @@ the same embedded bytes `resources/read` serves. The upstream MCP Inspector's
   spec plus a worked HTTP-API example. Read it before authoring a workload.
 - `cosmonic://host`, `cosmonic://workloads`, `cosmonic://templates` — live
   state, fetched at read time.
-- `skill://<name>/SKILL.md` — see above.
+- `skill://index.json`, `skill://<name>/SKILL.md` — see above.
 
 ## Environment
 

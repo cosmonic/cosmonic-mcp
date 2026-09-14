@@ -434,7 +434,9 @@ fn server_info() -> ServerInfo {
 /// what it does see — in its system prompt, before the first tool call, and
 /// regardless of tool-search deferral — is this text. The working group's
 /// own Claude-tuned server does the same, and its experiments found it the
-/// one reliable channel (`skills.rs` module docs). ~5 KB, once per session.
+/// one reliable channel. It also names the `skill://index.json` resource for
+/// clients that read resources but surface neither (`skills.rs` module docs,
+/// "Three channels, one catalog"). ~5 KB, once per session.
 fn instructions() -> String {
     format!("{PREAMBLE}\n\n{}\n{POSTSCRIPT}", skills::catalog())
 }
@@ -1127,10 +1129,10 @@ mod tests {
                 "instructions open a sentence with an imperative: {s:?}"
             );
         }
-        // The catalog is in there — every skill with its trigger — and the
-        // deprecated index is not.
+        // The catalog is in there — every skill with its trigger — and so are
+        // the two other channels a client might try.
         assert!(text.contains("skills/list"));
-        assert!(!text.contains("skill://index.json"));
+        assert!(text.contains("skill://index.json"));
         assert!(text.contains("cosmonic://schema/workload"));
         for skill in skills::SKILLS {
             assert!(
