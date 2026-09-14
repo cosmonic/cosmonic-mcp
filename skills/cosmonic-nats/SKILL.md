@@ -4,7 +4,7 @@ description: Build a NATS-driven WebAssembly component for Cosmonic Desktop on t
 license: Apache-2.0
 compatibility: Requires Cosmonic Desktop with the `cosmonic` MCP server (wasmCloud v2.8+ host; the wasmcloud:nats plugin is always registered) and a NATS server the host can reach (default nats://127.0.0.1:4222, JetStream on for the JetStream/KV patterns). Rust builds target wasm32-wasip2 (the target Desktop provisions); Go builds need componentize-go v0.4.1 (see the cosmonic-go skill; the -airgap installer's Go module bundles it, otherwise install it yourself).
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: Cosmonic
   upstream: "NATS-general references adapted from kaustavdm/nats-skill @ cbdda37 (MIT); templates and tuning from cosmonic-labs/nats-2.8-testing @ 5a437ac"
 ---

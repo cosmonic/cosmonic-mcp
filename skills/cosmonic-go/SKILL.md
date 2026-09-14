@@ -4,7 +4,7 @@ description: Build a Go WebAssembly component for Cosmonic Desktop with componen
 license: Apache-2.0
 compatibility: Cosmonic Desktop 0.5.27+ (go-http on componentize-go + the wasmCloud Go SDK; the fourteen go-nats-* starters). A lean (online) install provisions no Go toolchain — you install Go 1.25+ and componentize-go; the -airgap installer's Go module bundles both. No patched Go exists for Intel macOS or Windows-on-ARM64 offline (cosmonic/desktop#433).
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   author: Cosmonic
   upstream: "bytecodealliance/componentize-go v0.4.1 + main @ 20f3b0c; wasmCloud/go component/v0.1.3; golang/go#76775"
 ---

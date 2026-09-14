@@ -4,7 +4,7 @@ description: Build and run MCP servers, HTTP APIs, web UIs, webhooks, background
 license: Apache-2.0
 compatibility: Requires Cosmonic Desktop with its `cosmonic` MCP server registered in the agent (Desktop's Settings → MCP Server). Desktop's Preflight doctor provisions the Rust build toolchain (`rustc`, the `wasm32-wasip2` target, `wash`, `wkg`); Go and TypeScript are not provisioned (Go needs Go 1.25+ plus `componentize-go`, per the cosmonic-go skill; the `-airgap` installer's Go module bundles both). Network is used only for `wash new` and crate fetches (see "Air-gapped installations").
 metadata:
-  version: '1.1.0'
+  version: '1.2.0'
   author: Cosmonic
 ---
 
@@ -32,7 +32,7 @@ a host-native process (an npm `@modelcontextprotocol/sdk` stdio server, a Python
 | …that also calls an external API (weather, GitHub, Stripe) | same + `localResources.allowedHosts` | `references/recipes.md` §4, §6b |
 | …that uses a **local AI model** (Ollama, LM Studio, llama.cpp) | same + `allowedHostLoopbackPorts` | `references/local-ai.md` |
 | Anything on **NATS / JetStream** (subscribe, request/reply, durable consumer, KV, fan-out) | `rust-nats-<pattern>` / `go-nats-<pattern>` — never `rust-http` with `wasmcloud:nats` bolted on; the starters carry the world, the grants, and a working manifest | the **cosmonic-nats** skill (and **cosmonic-nats-tuning** before touching capacity) |
-| Anything on **Kafka** (produce to a topic, webhook → Kafka, consume/filter/notify per record, consume→transform→produce, exactly-once) | `rust-kafka-<pattern>` — never `rust-http` with `cosmonic:kafka` bolted on; the four starters carry the world, the topic grant, the handler keys and a working manifest (Rust only: the interface is async-only p3) | the **cosmonic-kafka** skill. The host plugin is Control's today — on Desktop before cosmonic/desktop#389 the scaffold builds and publishes, and a start fails cleanly with `requires cosmonic:kafka which this host does not provide` |
+| Anything on **Kafka** (produce to a topic, webhook → Kafka, consume/filter/notify per record, consume→transform→produce, seek/pause/rebalance control, exactly-once) | `rust-kafka-<pattern>` — never `rust-http` with `cosmonic:kafka` bolted on; the four starters carry the world, the topic grant, the handler keys and a working manifest (Rust only: the interface is async-only p3; `rust-kafka-handler-consumer` is the default — it can produce too) | the **cosmonic-kafka** skill. Desktop compiles in Control's `cosmonic:kafka@0.5.0` plugin; the host owns every client, so the binding — not the code — names the broker, group and topics, and needs a reachable broker with the topics created |
 | …**in Go** (the user asks for Go: `go-http`, `go-nats-*`) | the same starters, built by componentize-go on async WASI p3 | the **cosmonic-go** skill — the toolchain: known-good versions, install per OS (Windows-on-ARM64 included), the two build shapes, the gotchas |
 | Deploy an existing component image or repo | `cosmonic_workload_draft` → `cosmonic_workload_apply` | `references/crds.md` |
 | Persistent state, blob storage, background workers, raw TCP | an upstream `wash new` template + `hostInterfaces` | `references/templates.md` §B/§C, `references/crds.md` |
