@@ -10,7 +10,7 @@ members = ["crates/cosmonic-api"]
 [workspace.package]
 # Tracks the Cosmonic Desktop release this server is cut against; the version
 # is what `initialize` reports back to the client.
-version = "0.5.28"
+version = "0.5.29"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/cosmonic/cosmonic-mcp"
