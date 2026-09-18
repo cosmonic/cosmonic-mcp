@@ -19,7 +19,10 @@ use crate::server::CosmonicMcp;
 pub struct ScaffoldParams {
     /// Template id from `cosmonic_template_list`, e.g. "rust-http".
     pub template: String,
-    /// Absolute path for the new project directory. Must NOT already exist.
+    /// Absolute path of the project's own new directory, named for it: under
+    /// the directory the user named, else the current working directory, else
+    /// the `defaultProjectsDir` that `cosmonic_host_status` reports. Must NOT
+    /// already exist, and must not sit inside another project.
     pub path: String,
     /// Optional display name (defaults to the directory name).
     #[serde(default)]
@@ -343,7 +346,7 @@ impl CosmonicMcp {
     /// individual workloads (use `cosmonic_workload_list`).
     #[tool(
         title = "Host status",
-        description = "Reports the local Cosmonic Desktop daemon's version, state, HTTP ingress base URL, built-in registry coordinates, and workload/component counts.",
+        description = "Reports the local Cosmonic Desktop daemon's version, state, HTTP ingress base URL, built-in registry coordinates, workload/component counts, and the default projects directory (defaultProjectsDir) new projects go under when the user names none.",
         annotations(
             title = "Host status",
             read_only_hint = true,
@@ -372,7 +375,7 @@ impl CosmonicMcp {
     /// names, languages, and descriptions.
     #[tool(
         title = "List project templates",
-        description = "Lists the starter templates a new component project can be scaffolded from — rust-http/go-http/ts-http (HTTP), rust-mcp (MCP server), rust-/go-nats-<pattern> (NATS) and rust-kafka-<pattern> (Kafka) — with their language and toolchain requirements. Filter with `language`.",
+        description = "Lists the starter templates a new component project can be scaffolded from — rust-http/go-http/ts-http (HTTP), rust-mcp (MCP server), rust-/go-nats-<pattern> (NATS) and rust-kafka-<pattern> (Kafka) — with their language and toolchain requirements. An \"MCP server\" request maps to rust-mcp, a \"web server\" or \"HTTP API\" to rust-http, a \"Kafka producer\" / \"consumer\" to rust-kafka-http-producer / rust-kafka-handler-consumer, and a NATS \"JetStream consumer\" / \"key-value\" / \"subscriber\" to rust-nats-jetstream-consumer / rust-nats-kv-store / rust-nats-core-subscriber. Filter with `language`.",
         annotations(
             title = "List project templates",
             read_only_hint = true,
@@ -651,7 +654,7 @@ impl CosmonicMcp {
     /// Scaffold a new component project from a template into a fresh directory.
     #[tool(
         title = "Create project from template",
-        description = "Creates a new component project from a template in a directory that must not already exist, and returns the project id, the files to edit, and the build command. Writes files; it does not build or deploy.",
+        description = "Creates a new component project from a template in a directory that must not already exist, and returns the project id, the files to edit, and the build command. The directory is the project's own, named for it: under the directory the user named, else the current working directory, else the defaultProjectsDir that cosmonic_host_status reports. A path inside another project (an ancestor holding .wash/config.yaml) is refused naming that project; a path under a temp or agent scratch directory is accepted with a warning in `notes`. Writes files; it does not build or deploy.",
         annotations(
             title = "Create project from template",
             read_only_hint = false,
@@ -664,18 +667,41 @@ impl CosmonicMcp {
         &self,
         Parameters(p): Parameters<ScaffoldParams>,
     ) -> CallToolResult {
+        // Placement guards (the daemon checks only that the directory is
+        // absolute and empty). Nested projects have happened in the field —
+        // `confetti/hello-confetti-1cce` — when an agent scaffolded from inside
+        // the project it was already in, so that is refused. A temp or agent
+        // scratch directory is what the playbook forbids ("never write into
+        // ~/.<agent>/workspace, a scratch dir, or /tmp"), but a desktop chat
+        // client may have nowhere better; that one is a warning, not a refusal.
+        let path = std::path::Path::new(&p.path);
+        if let Some(parent) = enclosing_project(path) {
+            return self.fail(
+                "nested_project",
+                format!(
+                    "{} is inside the existing project at {} (it holds .wash/config.yaml). A project is its own directory, never nested in another.",
+                    path.display(),
+                    parent.display()
+                ),
+                format!(
+                    "Choose a directory beside {p}, not under it — or, to implement inside that project, skip scaffolding and use its id from cosmonic_project_list. If {p} is not really a project (a stray .wash/config.yaml at a projects root), remove that file and forget the registration with cosmonic_project_delete.",
+                    p = parent.display()
+                ),
+            );
+        }
+        let scratch_note = scratch_dir_warning(path, std::env::temp_dir(), dirs::home_dir());
         let body = json!({ "template": p.template, "path": p.path, "name": p.name });
-        self.reply(
-            self.client.post("/v1/projects/new", body).await,
-            &["cosmonic_dev_start"],
-        )
+        match self.client.post("/v1/projects/new", body).await {
+            Ok(v) => self.ok(with_note(v, scratch_note), &["cosmonic_dev_start"]),
+            other => self.reply(other, &["cosmonic_dev_start"]),
+        }
     }
 
     /// Build a project's component, run it as an ephemeral workload, and watch
     /// its sources for changes.
     #[tool(
         title = "Start dev loop",
-        description = "Builds a project's component, runs it as an ephemeral workload, and watches its sources so an edit rebuilds and hot-restarts it. Returns the dev state and the local URL it serves on. Compiling fetches dependencies.",
+        description = "Builds a project's component, runs it as an ephemeral workload, and watches its sources so an edit rebuilds and hot-restarts it. Returns the dev state and the local URL it serves on. The build runs the project's build command on the host, and a first build downloads crates or modules from the network.",
         annotations(
             title = "Start dev loop",
             read_only_hint = false,
@@ -1737,7 +1763,92 @@ pub(crate) fn summarize_workloads(v: Value) -> Value {
 /// the resolved `ingressBaseUrl` (from httpAddr — no port guessing), how to reach
 /// a workload (Host-header routing), how to push images locally, and the
 /// built-in OCI registry's live coordinates (from the system-workload set).
+/// The nearest ancestor of `path` (excluding `path` itself, which must not
+/// exist yet) that is a registered project: it holds `.wash/config.yaml`,
+/// the marker the daemon writes on scaffold and the Builder's "you are inside
+/// the project" test in the playbook. `None` when no ancestor is a project.
+fn enclosing_project(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".wash").join("config.yaml").is_file())
+        .map(std::path::Path::to_path_buf)
+}
+
+/// A warning when `path` is somewhere a project does not belong: the OS temp
+/// directory (`/tmp`, `/private/tmp`, `/var/tmp`, `$TMPDIR`, `%TEMP%`) or an
+/// agent's own scratch tree (`~/.<agent>/workspace`, `~/.<agent>/scratchpad`).
+/// The project would still build and run there, but it disappears on reboot or
+/// with the agent's session, and the daemon keeps a registration pointing at
+/// nothing. `temp` and `home` are passed in so the rule is testable.
+fn scratch_dir_warning(
+    path: &std::path::Path,
+    temp: std::path::PathBuf,
+    home: Option<std::path::PathBuf>,
+) -> Option<String> {
+    use std::path::{Component, Path};
+    let is_temp_root = |p: &Path| {
+        let parts: Vec<&str> = p
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => s.to_str(),
+                _ => None,
+            })
+            .collect();
+        matches!(
+            parts.as_slice(),
+            ["tmp", ..] | ["private", "tmp", ..] | ["var", "tmp", ..]
+        )
+    };
+    let temp = temp.components().count() > 1 && path.starts_with(&temp);
+    if temp || is_temp_root(path) {
+        return Some(format!(
+            "{} is under a temp directory: the project will vanish on reboot or cleanup while the daemon keeps it registered. A lasting home is a directory of the user's, or the defaultProjectsDir that cosmonic_host_status reports.",
+            path.display()
+        ));
+    }
+    if let Some(home) = home {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            let parts: Vec<&str> = rel
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(s) => s.to_str(),
+                    _ => None,
+                })
+                .collect();
+            if let [agent, kind, ..] = parts.as_slice() {
+                if agent.starts_with('.') && matches!(*kind, "workspace" | "scratchpad") {
+                    return Some(format!(
+                        "{} is inside an agent's scratch tree (~/{agent}/{kind}): it is not a place the user looks and may be cleared with the session. A lasting home is a directory of the user's, or the defaultProjectsDir that cosmonic_host_status reports.",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Append `note` to the daemon's `notes` array (creating it if the daemon sent
+/// none) so a warning rides in the same place the daemon's own notes do.
+fn with_note(mut v: Value, note: Option<String>) -> Value {
+    if let Some(note) = note {
+        match v.get_mut("notes").and_then(Value::as_array_mut) {
+            Some(notes) => notes.push(json!(note)),
+            None => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("notes".into(), json!([note]));
+                }
+            }
+        }
+    }
+    v
+}
+
 fn augment_host(mut v: Value, system: Option<&Value>) -> Value {
+    // Every field the daemon serves rides through untouched — including
+    // `defaultProjectsDir`, the directory the Desktop app's Builder scaffolds
+    // under, once the daemon reports it. Nothing is hard-coded here in its
+    // place: a path the daemon did not say is a guess.
     if let Some(obj) = v.as_object_mut() {
         let addr = obj
             .get("httpAddr")
@@ -2410,6 +2521,98 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    // ---- project placement guards --------------------------------------
+
+    /// A scratch tree under the OS temp dir that no other test shares.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cosmonic-mcp-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_path_inside_a_registered_project_names_the_enclosing_project() {
+        let root = scratch("nested");
+        let project = root.join("confetti");
+        std::fs::create_dir_all(project.join(".wash")).unwrap();
+        std::fs::write(project.join(".wash/config.yaml"), "name: confetti\n").unwrap();
+
+        // Direct child, and a deeper descendant, of the project.
+        assert_eq!(
+            enclosing_project(&project.join("hello-confetti-1cce")),
+            Some(project.clone())
+        );
+        assert_eq!(
+            enclosing_project(&project.join("src").join("deeper")),
+            Some(project.clone())
+        );
+        // Beside it is fine, and so is the project's own path (the guard looks
+        // at ancestors only — "already exists" is the daemon's check).
+        assert_eq!(enclosing_project(&root.join("sibling")), None);
+        assert_eq!(enclosing_project(&project), None);
+        // A `.wash` directory without config.yaml is not a project.
+        let half = root.join("half");
+        std::fs::create_dir_all(half.join(".wash")).unwrap();
+        assert_eq!(enclosing_project(&half.join("child")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_temp_or_agent_scratch_path_warns_and_a_user_path_does_not() {
+        use std::path::{Path, PathBuf};
+        let home = Some(PathBuf::from("/Users/me"));
+        let temp = PathBuf::from("/var/folders/ab/T");
+        let warn = |p: &str| scratch_dir_warning(Path::new(p), temp.clone(), home.clone());
+
+        // The OS temp roots, whatever `temp_dir()` says.
+        assert!(warn("/tmp/weather-mcp").unwrap().contains("temp directory"));
+        assert!(warn("/private/tmp/claude-503/x/scratchpad/weather-mcp").is_some());
+        assert!(warn("/var/tmp/weather-mcp").is_some());
+        // `$TMPDIR` itself (macOS puts it under /var/folders).
+        assert!(warn("/var/folders/ab/T/weather-mcp").is_some());
+        // An agent's own scratch tree under the home directory.
+        assert!(warn("/Users/me/.claude/workspace/weather-mcp")
+            .unwrap()
+            .contains("scratch tree"));
+        assert!(warn("/Users/me/.hermes/scratchpad/weather-mcp").is_some());
+        // Places a project belongs.
+        assert_eq!(warn("/Users/me/cosmonic-projects/weather-mcp"), None);
+        assert_eq!(warn("/Users/me/src/weather-mcp"), None);
+        assert_eq!(warn("/Users/me/.config/weather-mcp"), None);
+        assert_eq!(warn("/Users/me/tmp/weather-mcp"), None);
+        assert_eq!(warn("/srv/apps/weather-mcp"), None);
+        // No home known: only the temp rule applies.
+        assert_eq!(
+            scratch_dir_warning(Path::new("/x/.claude/workspace/y"), temp.clone(), None),
+            None
+        );
+        // A degenerate temp_dir ("/") must not flag every path.
+        assert_eq!(
+            scratch_dir_warning(Path::new("/Users/me/app"), PathBuf::from("/"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_warning_rides_in_the_daemon_notes() {
+        let v = json!({ "project": { "id": "x" }, "notes": ["scaffolded x"] });
+        let out = with_note(v, Some("careful".into()));
+        assert_eq!(out["notes"], json!(["scaffolded x", "careful"]));
+        // No notes from the daemon: the array is created.
+        let out = with_note(json!({ "project": {} }), Some("careful".into()));
+        assert_eq!(out["notes"], json!(["careful"]));
+        // No warning: untouched.
+        let v = json!({ "project": {}, "notes": ["a"] });
+        assert_eq!(with_note(v.clone(), None), v);
     }
 
     #[test]

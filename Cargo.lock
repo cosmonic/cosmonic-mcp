@@ -95,7 +95,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cosmonic-api"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "cosmonic-mcp"
-version = "0.5.28"
+version = "0.5.29"
 dependencies = [
  "anyhow",
  "cosmonic-api",

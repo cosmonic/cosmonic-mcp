@@ -3,6 +3,9 @@
 //! These types are the wire contract between the daemon and its clients
 //! (Electron app, future CLI). See docs/ARCHITECTURE.md §3.3.
 
+/// GENERATED — the vendored Hugging Face agent-harness registry
+/// (`scripts/vendor-agent-harnesses.mjs`); consumed by [`telemetry`].
+mod agent_harnesses;
 pub mod telemetry;
 pub mod workload;
 
@@ -1461,6 +1464,209 @@ pub struct NatsTestResult {
     /// A caveat on a success — e.g. the server did not require
     /// authentication, so the credential offered was never exercised (NATS
     /// ignores credentials when auth is off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+// ---- /v1/kafka (daemon/docs/KAFKA.md; cosmonic:kafka on Control's plugin-kafka) ----
+
+/// One named `cosmonic:kafka` binding (`name: <binding>` on a workload's
+/// hostInterface — its `(implements <binding>)` label), layered over the
+/// top-level `config`/`secret_from`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaBinding {
+    /// librdkafka properties plus the plugin's own (`topics`, `handler.*`,
+    /// `dead-letter.topic`), spelled the way librdkafka reads them. Never a
+    /// credential VALUE.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Names of registered secret refs whose values join THIS binding's layer
+    /// at boot; each ref's target key is the credential it supplies
+    /// (`SASL_PASSWORD` → `sasl.password`, `SSL_KEY_PASSWORD`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+}
+
+/// `<state_dir>/kafka.yaml` — the operator's `cosmonic:kafka` DEFAULTS
+/// (`GET`/`PUT /v1/kafka`). A base a binding inherits and a workload's own
+/// `cosmonic:kafka` config overrides key by key. Baked into the host at boot,
+/// so a PUT takes effect on the next daemon restart; `GET` reports stored vs
+/// active. Every field optional; nothing declared is a valid file. Closed
+/// (`deny_unknown_fields`): a typo'd top-level key is refused, not ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaSettings {
+    /// Defaults for the unnamed binding, and the base under every named one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Registered secret refs whose VALUES join that layer at boot (names
+    /// only in the file; a ref must target a credential key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+    /// Defaults for named bindings (`(implements <name>)`), each over `config`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, KafkaBinding>,
+}
+
+/// `GET /v1/kafka`: stored vs active declaration plus boot-time diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaStatus {
+    /// What `<state_dir>/kafka.yaml` holds now — what the NEXT daemon start
+    /// uses, unless the machine layer's file is deployed (`managed`).
+    pub settings: KafkaSettings,
+    /// What the running host was built with (the machine layer's file when
+    /// one was deployed and valid at boot, else the user's as it was then).
+    pub active: KafkaSettings,
+    /// The enterprise machine layer's `kafka.yaml` replaced the user's file
+    /// for this boot (docs/MULTI-TENANCY.md §3): `settings` is stored but
+    /// dormant, and `active` is the machine's declaration.
+    #[serde(default)]
+    pub managed: bool,
+    /// Whether this build registers the plugin at all (the `kafka` cargo
+    /// feature). `false` = a `--no-default-features` daemon: the file is still
+    /// read and stored, but no workload can bind `cosmonic:kafka`.
+    #[serde(default)]
+    pub compiled_in: bool,
+    /// Secret refs the active declaration named that did not resolve at boot
+    /// (ref names + backend error; never values). A binding missing its
+    /// credential fails at connect with the broker's own authorization error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_errors: Vec<String>,
+}
+
+/// `POST /v1/kafka/test` body: open one librdkafka client from the daemon —
+/// the process that really dials at bind — fetch the cluster's metadata, and
+/// report what answered. A probe, not a save: nothing is persisted and the
+/// running host is not touched. Snake_case like [`KafkaSettings`], so the
+/// Settings → Built-in plugins → Kafka form can post what it holds.
+///
+/// Two shapes, one route:
+/// - **saved** — `draft: false`: test the STORED binding `name` (`""`/absent
+///   is the unnamed default) layered exactly as boot layers it — base
+///   literals, base refs, the binding's literals, the binding's refs — with
+///   the refs resolved the way boot resolves them.
+/// - **draft** — `draft: true`: `config`/`secret_from` are the layer the form
+///   holds and has not saved. With a non-empty `name` it is a NAMED draft and
+///   is laid over the stored base (`config`/`secret_from`), which is what the
+///   host will do with it once saved; with `""`/absent it is the whole layer.
+///
+/// A draft may carry a credential literally (`config."sasl.password"`); it is
+/// used for the one dial and dropped. `PUT /v1/kafka` still refuses it — the
+/// store's rule (values via `secret_from` only) is about what gets written to
+/// disk.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    /// Literal keys, as [`KafkaBinding::config`]. The plugin's own keys
+    /// (`topics`, `handler.*`) are read for the topic check and never handed
+    /// to librdkafka.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Secret refs merged in last, as [`KafkaBinding::secret_from`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+}
+
+// Manual Debug: a draft's `config` may carry a credential value.
+impl std::fmt::Debug for KafkaTestRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaTestRequest")
+            .field("name", &self.name)
+            .field("draft", &self.draft)
+            .field("config", &self.config.keys().collect::<Vec<_>>())
+            .field("secret_from", &self.secret_from)
+            .finish()
+    }
+}
+
+/// Where a failed probe stopped, coarsest first — what the UI colours and
+/// what the fix is: the declaration, the network, or the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaTestStage {
+    /// Nothing was dialed: no broker anywhere in the layer, a secret ref did
+    /// not resolve, librdkafka refused the configuration (an unknown
+    /// property, a mechanism this build lacks), or a broker is outside the
+    /// machine egress allow-list.
+    Resolve,
+    /// The dial itself failed: refused, timed out, DNS, or the TLS handshake.
+    Connect,
+    /// A broker answered and refused the credential (SASL failed).
+    Auth,
+}
+
+impl KafkaTestStage {
+    /// The wire spelling, for audit reasons and log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Connect => "connect",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+/// One topic the layer grants (`topics`, `handler.topics`, `dead-letter.topic`),
+/// as the cluster reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestTopic {
+    pub name: String,
+    /// The cluster has this topic (partition count on success).
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<u32>,
+}
+
+/// `POST /v1/kafka/test` response — always HTTP 200 (a probe's failure *is*
+/// its result; 400 is reserved for a malformed body). Never carries a
+/// credential value: every sentence is scrubbed against the values the probe
+/// resolved before it is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestResult {
+    /// A broker answered the metadata request.
+    pub ok: bool,
+    /// The `bootstrap.servers` the probe dialed, after the base layer was
+    /// applied — what a binding would dial.
+    pub brokers: String,
+    /// `security.protocol` as the layer resolved it (librdkafka's spelling,
+    /// `PLAINTEXT` when unset).
+    pub security_protocol: String,
+    /// `sasl.mechanism`, when the protocol is a SASL one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_mechanism: Option<String>,
+    /// The protocol is `SSL` or `SASL_SSL`.
+    pub tls: bool,
+    /// Whether a credential VALUE was in the layer (a `sasl.password`, an
+    /// OAuth client secret, a key password — from a ref or a draft literal).
+    /// Names nothing; lets the UI say "offered a credential".
+    pub credential: bool,
+    /// On success: the metadata round trip in ms, excluding secret-ref
+    /// resolution. On failure: wall time until the probe gave up.
+    pub latency_ms: u64,
+    /// On success: how many brokers the cluster advertises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_count: Option<u32>,
+    /// On success: the broker that answered (`host:port`, as it names itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    /// On success: the cluster's topic count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_count: Option<u32>,
+    /// On success: every topic the layer grants, and whether it exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<KafkaTestTopic>,
+    /// On failure: where it stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<KafkaTestStage>,
+    /// On failure: one actionable sentence, safe to render verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// A caveat on a success — e.g. a granted topic is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }

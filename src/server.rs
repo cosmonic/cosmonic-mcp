@@ -49,7 +49,10 @@ pub struct CosmonicMcp {
     /// Which agent connected, as a fixed enum from [`catalog::MCP_CLIENTS`] —
     /// never the raw `clientInfo.name`, which the client controls and which
     /// routinely carries a path or a hostname. Set once, at `initialize`.
-    client_id: Arc<OnceLock<(&'static str, String)>>,
+    /// `(client, client_version_major, harness)` from the handshake — the
+    /// self-reported client and the harness detected from our own environment
+    /// (issue #527), kept for the disconnect event.
+    client_id: Arc<OnceLock<(&'static str, String, &'static str)>>,
     /// Tool calls in this session, for `mcp_client_disconnected`.
     tools_invoked: Arc<AtomicU64>,
 }
@@ -459,17 +462,26 @@ impl ServerHandler for CosmonicMcp {
     /// `clientInfo.name` is chosen by the client, so it is never sent as-is:
     /// [`catalog::normalize_mcp_client`] maps it onto a known agent or `other`,
     /// and only the MAJOR version travels.
+    ///
+    /// `harness` is the second, independent signal: the agent that spawned us
+    /// left its marker in the environment we inherited, and
+    /// [`cosmonic_api::telemetry::detect_agent_harness`] names it from a
+    /// vendored registry — presence-only, a fixed enum, never a value.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        let client = cosmonic_api::telemetry::normalize_mcp_client(&request.client_info.name);
+        let client = cosmonic_api::telemetry::normalize_mcp_client_info(
+            &request.client_info.name,
+            request.client_info.title.as_deref(),
+        );
         let version = cosmonic_api::telemetry::version_major(&request.client_info.version);
-        let _ = self.client_id.set((client, version.clone()));
+        let harness = cosmonic_api::telemetry::detect_agent_harness_from_env();
+        let _ = self.client_id.set((client, version.clone(), harness));
         self.track(
             "mcp_client_connected",
-            json!({ "client": client, "client_version_major": version }),
+            json!({ "client": client, "client_version_major": version, "harness": harness }),
         )
         .await;
 
@@ -876,12 +888,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let outcome = running.waiting().await;
     // Session over. Report how long the agent stayed and how much it did —
     // buckets only, and only if it ever completed a handshake.
-    if let Some((client_id, _)) = session.client_id.get() {
+    if let Some((client_id, _, harness)) = session.client_id.get() {
         session
             .track(
                 "mcp_client_disconnected",
                 json!({
                     "client": client_id,
+                    "harness": harness,
                     "session_duration_bucket": cosmonic_api::telemetry::session_secs(started.elapsed().as_secs()),
                     "tools_invoked_bucket": cosmonic_api::telemetry::count_results(
                         session.tools_invoked.load(Ordering::Relaxed),
