@@ -20,7 +20,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt --all --check
+      # crates/cosmonic-api is a verbatim copy of the monorepo's (see
+      # scripts/sync-from-desktop.sh), so it is formatted there, not here:
+      # reformatting it would make the sync report drift.
+      - run: cargo fmt -p cosmonic-mcp --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 

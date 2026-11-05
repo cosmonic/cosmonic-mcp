@@ -14,14 +14,24 @@ The unit of deployment. JSON (camelCase) accepted by `cosmonic_workload_apply`
 and `POST /v1/workloads`. The daemon pins `image` to a digest at apply and
 cosign-verifies it per policy on every start.
 
+A `kind: WorkloadDeployment` document is accepted too, and is what a manifest
+written for Cosmonic Control looks like: the same spec nested under
+`.spec.template.spec`, with `replicas` beside it. The daemon reads the workload
+out of it and applies that, so a Control manifest needs no editing to run here.
+`replicas` belongs to a cluster and a single host runs one, which the apply
+reports rather than silently ignoring. Everything below describes the spec
+either kind carries.
+
 ## Fields
 - `apiVersion`: always `"runtime.wasmcloud.dev/v1alpha1"`
-- `kind`: always `"Workload"`
+- `kind`: `"Workload"`, or `"WorkloadDeployment"` to apply a Control manifest
+  as written
 - `metadata.name`: DNS label (lowercase alnum + `-`, <=63). Required.
 - `metadata.namespace`: DNS label, default `"default"`.
 - `metadata.annotations`: map. `desktop.cosmonic.com/enabled: "true"` keeps it
   running (apply enables by default).
-- `spec.components[]`: at least one.
+- `spec.components[]`: the components the host INVOKES, call by call (an HTTP
+  handler, a plugin handler). At least one, unless `spec.service` is set.
   - `name`: DNS label. `image`: OCI ref (e.g. `ghcr.io/acme/api:0.1.0`).
   - `poolSize`: warm instances parked between calls (default 1; 0 = a fresh
     instance per call). `maxInvocations`: calls one warm instance serves before
@@ -45,6 +55,17 @@ cosign-verifies it per policy on every start.
     `"514/udp"`, with no ranges/wildcards. Empty = deny-all, AND inert unless the
     host operator also enabled loopback grants (Settings → Security); do not
     promise it works without that.
+- `spec.service`: optional, at most one. A component that exports
+  `wasi:cli/run` and runs for the life of the workload (a Kafka pull-service,
+  a TCP listener). The role must be chosen explicitly: a `wasi:cli/run`
+  export alone does not distinguish a one-shot component from a service. A
+  workload may have a service and no components.
+  - `image`: OCI ref. `maxRestarts`: how many times the host re-runs a failed
+    `run` (default 0).
+  - `localResources`: the same fields as a component's (`environment`,
+    `allowedHosts`, `allowedHostLoopbackPorts`).
+  - A new revision replaces a service workload in place (stop, then start),
+    never alongside the old one.
 - `spec.hostInterfaces[]`: capabilities the workload uses/exports. For an HTTP
   API, expose the handler so the ingress routes to it:
   `{ namespace: "wasi", package: "http", interfaces: ["handler"],
@@ -169,7 +190,7 @@ pub fn capabilities(
         .unwrap_or(false);
     out.insert("egress".into(), json!({
         "default": "deny-all",
-        "note": "A component reaches only the hosts in its `spec.components[].localResources.allowedHosts`. An empty list denies everything, so a missing host surfaces as a connection failure rather than a permission error.",
+        "note": "A component reaches only the hosts in its own `localResources.allowedHosts` (`spec.components[]` or `spec.service`). An empty list denies everything, so a missing host surfaces as a connection failure rather than a permission error.",
         "hostLoopback": {
             "enabled": loopback,
             "note": if loopback {

@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: &str = "runtime.wasmcloud.dev/v1alpha1";
 pub const KIND_WORKLOAD: &str = "Workload";
+/// Cosmonic Control's deployment kind. Cosmonic Desktop runs the workload it
+/// wraps rather than the deployment itself, so a manifest written for Control
+/// applies here unchanged. See [`Workload::from_manifest`].
+pub const KIND_WORKLOAD_DEPLOYMENT: &str = "WorkloadDeployment";
 
 /// Annotation marking whether the reconciler should keep this workload running.
 pub const ANNOTATION_ENABLED: &str = "desktop.cosmonic.com/enabled";
@@ -26,6 +30,16 @@ pub const ANNOTATION_UNSAFE_ALLOW_UNSIGNED: &str = "desktop.cosmonic.com/unsafe-
 /// revision spec hash (annotations aren't hashed there), so it never churns
 /// revisions.
 pub const ANNOTATION_SOURCE_HASH: &str = "desktop.cosmonic.com/source-hash";
+/// The kind a workload was read out of, when that was not `Workload`. Set by
+/// [`Workload::from_deployment`]; read by [`Workload::ignored_portability_fields`]
+/// and by anything reconstructing the manifest a user actually wrote.
+pub const ANNOTATION_FROM_KIND: &str = "desktop.cosmonic.com/from-kind";
+/// `spec.replicas` as the deployment asked for it. A single host runs one, so
+/// this is a record rather than an instruction.
+pub const ANNOTATION_REPLICAS: &str = "desktop.cosmonic.com/replicas";
+/// Comma-separated cluster-only fields the envelope carried that this host
+/// cannot act on, so the apply-notes event can name them.
+pub const ANNOTATION_UNSUPPORTED_FIELDS: &str = "desktop.cosmonic.com/unsupported-fields";
 
 /// Annotation recording which surface applied a workload (best-effort, set at
 /// apply time). Surfaced in `GET /v1/workloads` and aggregated by usage
@@ -93,15 +107,91 @@ fn default_namespace() -> String {
     "default".to_string()
 }
 
+/// A Cosmonic Control `WorkloadDeployment` document.
+///
+/// Typed rather than hand-walked for four reasons: a derived `Deserialize`
+/// refuses a duplicate key where a `Value` walk takes the last silently; the
+/// same code reads YAML and JSON, so synthesis needs no cross-format
+/// conversion; serde's errors name the full path; and a field named here is a
+/// field that cannot be dropped without someone noticing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadDeploymentDoc {
+    pub api_version: String,
+    pub kind: String,
+    /// Defaulted so a document with no `metadata` block reports one missing
+    /// name rather than a missing name and an empty namespace.
+    #[serde(default = "default_metadata")]
+    pub metadata: Metadata,
+    pub spec: WorkloadDeploymentSpec,
+}
+
+/// `WorkloadDeployment.spec`: the replica count, the workload template, and
+/// the two cluster-only fields Desktop records but cannot act on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadDeploymentSpec {
+    /// Hosts a cluster would run this on. Named as a signed integer so a
+    /// negative or fractional value is a parse error the author can read,
+    /// rather than falling through an `as_u64` and being ignored.
+    #[serde(default)]
+    pub replicas: Option<i64>,
+    pub template: WorkloadReplicaTemplate,
+    /// A cluster's rollout strategy. Preserved for reporting only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_policy: Option<serde_json::Value>,
+    /// `Artifact` references a cluster resolves into component images. Desktop
+    /// has no Artifact controller, so a spec that binds its image this way is
+    /// reported rather than silently starting without one.
+    #[serde(default)]
+    pub artifacts: Vec<serde_json::Value>,
+    /// The operator's EndpointSlice and Service DNS aliases. A manifest whose
+    /// reachability story is Service DNS has none of it here, so this is
+    /// reported rather than dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<serde_json::Value>,
+}
+
+/// `WorkloadDeployment.spec.template`. Note the labels and annotations are
+/// flat here, not under a nested `metadata` as k8s habit suggests.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadReplicaTemplate {
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+    /// Not a field this template has. Captured only so a document written from
+    /// Kubernetes `Deployment` habit, where labels live under
+    /// `template.metadata`, is told they were ignored instead of losing them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    pub spec: WorkloadSpec,
+}
+
+fn default_metadata() -> Metadata {
+    Metadata {
+        namespace: default_namespace(),
+        ..Metadata::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_interfaces: Vec<HostInterface>,
+    /// May be omitted (or empty) when `service` is set. Always serialized, so
+    /// a client reading the wire always finds the array.
+    #[serde(default)]
     pub components: Vec<Component>,
-    /// Optional long-running **service sidecar** (the wasmCloud v2 Workload's
-    /// `service`): a component exporting `wasi:cli/run` that owns localhost
-    /// ports (e.g. the service-tcp template). Drives the UI Services tab.
+    /// Optional long-running **service** (the wasmCloud v2 Workload's
+    /// `service`): a component exporting `wasi:cli/run`, which the runtime
+    /// drives for the life of the workload — a component under `components`
+    /// is only ever invoked, so its `run` is never called. It may own
+    /// localhost ports (e.g. the service-tcp template) or a plugin session
+    /// (the Kafka pull-service starter). A workload may carry a service and
+    /// no components at all. Drives the UI Services tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<WorkloadService>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -130,7 +220,7 @@ pub struct WorkloadSpec {
     pub kubernetes: Option<serde_json::Value>,
 }
 
-/// A service sidecar — matches the runtime-operator CRD / `wash_runtime`
+/// A workload's service — matches the runtime-operator CRD / `wash_runtime`
 /// `types::Service` shape. Like a component it is pulled by OCI ref and pinned
 /// at apply time, but it is *long-running and restartable* (`max_restarts`)
 /// rather than pooled/invoked.
@@ -156,6 +246,15 @@ pub struct WorkloadService {
     pub max_restarts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_resources: Option<LocalResources>,
+}
+
+impl WorkloadService {
+    /// The name the service is keyed by wherever it sits beside components —
+    /// status `componentInterfaces` and `imageDigests`, revision artifacts,
+    /// the inspect graph: its `name`, else `"service"`.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("service")
+    }
 }
 
 /// k8s `corev1.LocalObjectReference` — a by-name reference to an object in
@@ -357,8 +456,10 @@ impl Workload {
     /// The draft/dev single-component Workload shape shared by synth
     /// (paste-to-run drafts) and project mode (dev + publish): one component
     /// named after the workload, `pool_size` 1, no invocation cap, no service
-    /// sidecar or volumes. The caller owns the egress decision via
-    /// `local_resources` (dev allow-all vs publish deny-all).
+    /// or volumes. The caller owns the egress decision via
+    /// `local_resources` (dev allow-all vs publish deny-all). Callers use
+    /// [`Workload::single_service`] only when the user chose the service role;
+    /// a `wasi:cli/run` export alone is ambiguous.
     #[must_use]
     pub fn single_component(
         name: &str,
@@ -389,6 +490,47 @@ impl Workload {
         )
     }
 
+    /// [`Workload::single_component`]'s counterpart for an artifact that runs
+    /// as the workload's **service** (it exports `wasi:cli/run`): no
+    /// components, one unnamed service with the runtime's restart default.
+    /// The service is left unnamed on purpose — `name` is a Desktop display
+    /// field Control's CRD does not carry, and a draft must stay portable.
+    #[must_use]
+    pub fn single_service(
+        name: &str,
+        namespace: &str,
+        image: String,
+        host_interfaces: Vec<HostInterface>,
+        local_resources: Option<LocalResources>,
+    ) -> Self {
+        Self::new(
+            name,
+            namespace,
+            WorkloadSpec {
+                host_interfaces,
+                service: Some(WorkloadService {
+                    name: None,
+                    image,
+                    image_pull_secret: None,
+                    image_pull_policy: None,
+                    max_restarts: None,
+                    local_resources,
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Every runnable's image, components first then the service — the set
+    /// a pull, a pin or an image list walks.
+    pub fn images(&self) -> impl Iterator<Item = &str> {
+        self.spec
+            .components
+            .iter()
+            .map(|c| c.image.as_str())
+            .chain(self.spec.service.iter().map(|s| s.image.as_str()))
+    }
+
     pub fn enabled(&self) -> bool {
         self.metadata
             .annotations
@@ -411,6 +553,170 @@ impl Workload {
         self.metadata
             .annotations
             .insert(ANNOTATION_ENABLED.to_string(), enabled.to_string());
+    }
+
+    /// Build a workload from a Control deployment envelope.
+    ///
+    /// A `WorkloadDeployment` wraps the same spec a `Workload` carries, under
+    /// `.spec.template.spec`, with `replicas` beside it. The two describe the
+    /// same workload, so a manifest written for Cosmonic Control runs here and
+    /// the envelope is unwrapped rather than refused.
+    ///
+    /// What the envelope carries and one host does not is recorded on the
+    /// workload, not dropped: `replicas` and the kind it came from become
+    /// annotations, so [`Workload::ignored_portability_fields`] reports them
+    /// at apply through the same Info event that already covers `hostSelector`
+    /// and friends, and a round trip back to a cluster can see what was lost.
+    /// Annotations are outside the revision spec hash, so this adds no churn.
+    ///
+    /// `replicas: 0` scales a deployment to nothing on a cluster. The nearest
+    /// honest thing here is a workload that exists and does not run, which is
+    /// what `enabled: false` already means, so the workload is applied stopped
+    /// rather than started against the author's intent.
+    ///
+    /// `HTTPTrigger` is deliberately not handled here. It is a translation
+    /// rather than an envelope: an ingress binding has to be derived from
+    /// `spec.ingress.host`, and inventing a hostInterface during an apply is a
+    /// bigger surprise than dropping `replicas`. That belongs in synthesis,
+    /// where the user reviews the derived spec before it is applied.
+    pub fn from_deployment(doc: WorkloadDeploymentDoc) -> (Self, Vec<String>) {
+        let mut notes = Vec::new();
+        let WorkloadDeploymentDoc {
+            api_version,
+            kind,
+            mut metadata,
+            spec,
+        } = doc;
+
+        // The template's labels and annotations describe the workloads the
+        // deployment creates; the deployment's describe the deployment. The
+        // more specific one wins where both name the same key.
+        metadata.labels.extend(spec.template.labels);
+        metadata.annotations.extend(spec.template.annotations);
+
+        let mut workload = Self {
+            api_version,
+            kind: KIND_WORKLOAD.to_string(),
+            metadata,
+            spec: spec.template.spec,
+        };
+        workload
+            .metadata
+            .annotations
+            .insert(ANNOTATION_FROM_KIND.to_string(), kind);
+
+        // Two cluster-only fields with no local equivalent. `artifacts` is the
+        // costly one: a spec that binds its image through an `Artifact` has no
+        // image here, and "component has no image" names nothing a reader can
+        // act on without this.
+        let mut unsupported = Vec::new();
+        if !spec.artifacts.is_empty() {
+            unsupported.push("spec.artifacts");
+        }
+        if spec.deploy_policy.is_some() {
+            unsupported.push("spec.deployPolicy");
+        }
+        if spec.kubernetes.is_some() {
+            unsupported.push("spec.kubernetes");
+        }
+        if !spec.artifacts.is_empty() {
+            notes.push(format!(
+                "spec.artifacts names {} Artifact reference(s), which a cluster resolves into \
+                 component images. This host has no Artifact controller: set `image` on each \
+                 component instead.",
+                spec.artifacts.len()
+            ));
+        }
+        if spec.template.metadata.is_some() {
+            notes.push(
+                "spec.template.metadata is not a field here. A WorkloadDeployment carries its \
+                 labels and annotations directly on spec.template, so anything under \
+                 spec.template.metadata was ignored."
+                    .to_string(),
+            );
+        }
+        if spec.kubernetes.is_some() {
+            notes.push(
+                "spec.kubernetes is the operator's EndpointSlice and Service DNS. A single host \
+                 has neither: reach this workload through its wasi:http host config instead."
+                    .to_string(),
+            );
+        }
+        if spec.deploy_policy.is_some() {
+            notes.push(
+                "spec.deployPolicy is a cluster's rollout strategy and does not apply to a \
+                 single host."
+                    .to_string(),
+            );
+        }
+
+        if !unsupported.is_empty() {
+            workload.metadata.annotations.insert(
+                ANNOTATION_UNSUPPORTED_FIELDS.to_string(),
+                unsupported.join(","),
+            );
+        }
+
+        if let Some(replicas) = spec.replicas {
+            workload
+                .metadata
+                .annotations
+                .insert(ANNOTATION_REPLICAS.to_string(), replicas.to_string());
+            if replicas == 0 {
+                workload.set_enabled(false);
+                notes.push(
+                    "replicas: 0 means a cluster runs none of these, so this is applied \
+                     stopped. Start it when you want it running."
+                        .to_string(),
+                );
+            } else if replicas != 1 {
+                notes.push(format!(
+                    "replicas: {replicas} asks a cluster for {replicas} hosts. This host is \
+                     one, so one instance runs. Use poolSize for local concurrency."
+                ));
+            }
+        }
+
+        (workload, notes)
+    }
+
+    /// Read either kind this host can run from a JSON manifest body.
+    ///
+    /// A `Workload` is the flat shape the daemon stores; a
+    /// `WorkloadDeployment` is [`Workload::from_deployment`]. Anything else,
+    /// including a missing or unknown kind, is read as a flat `Workload` so
+    /// that [`Workload::validate`] reports the kind itself rather than serde
+    /// reporting a field the author never meant to write.
+    ///
+    /// Reads from the raw body, not a pre-parsed `serde_json::Value`, so that
+    /// a duplicate key is still refused. `serde_json::Value` merges duplicates
+    /// last-wins before any derived `Deserialize` sees them, and on an
+    /// endpoint whose namespace decides an authorization guard, the parse that
+    /// decides which `metadata` wins should be the strict one.
+    pub fn from_manifest_slice(body: &[u8]) -> Result<(Self, Vec<String>), Vec<String>> {
+        #[derive(Deserialize)]
+        struct KindOnly {
+            #[serde(default)]
+            kind: String,
+        }
+        let peek: KindOnly = serde_json::from_slice(body)
+            .map_err(|e| vec![format!("body is not a JSON manifest: {e}")])?;
+        if peek.kind == KIND_WORKLOAD_DEPLOYMENT {
+            return serde_json::from_slice::<WorkloadDeploymentDoc>(body)
+                .map(Self::from_deployment)
+                .map_err(|e| vec![format!("invalid {KIND_WORKLOAD_DEPLOYMENT} manifest: {e}")]);
+        }
+        serde_json::from_slice::<Self>(body)
+            .map(|w| (w, Vec::new()))
+            .map_err(|e| vec![format!("invalid {KIND_WORKLOAD} manifest: {e}")])
+    }
+
+    /// [`Workload::from_manifest_slice`] for a value already in hand. Callers
+    /// holding raw bytes should prefer the slice form, which is stricter.
+    pub fn from_manifest(value: serde_json::Value) -> Result<(Self, Vec<String>), Vec<String>> {
+        let body = serde_json::to_vec(&value)
+            .map_err(|e| vec![format!("manifest is not serializable: {e}")])?;
+        Self::from_manifest_slice(&body)
     }
 
     /// Basic structural validation; returns human-actionable messages.
@@ -440,8 +746,10 @@ impl Workload {
                 self.metadata.namespace
             ));
         }
-        if self.spec.components.is_empty() {
-            errs.push("spec.components must not be empty".to_string());
+        // A service-only workload is valid (the runtime drives the service
+        // and invokes no component); a workload with neither runs nothing.
+        if self.spec.components.is_empty() && self.spec.service.is_none() {
+            errs.push("spec must declare at least one component or a service".to_string());
         }
         for c in &self.spec.components {
             if c.name.is_empty() {
@@ -450,6 +758,10 @@ impl Workload {
             if c.image.is_empty() {
                 errs.push(format!("component {:?} has no image", c.name));
             }
+        }
+        let names = self.spec.components.iter().map(|c| c.name.as_str());
+        if let Some(name) = duplicate_component_name(names) {
+            errs.push(duplicate_component_message(name));
         }
         if let Some(service) = &self.spec.service {
             if service.image.is_empty() {
@@ -495,8 +807,53 @@ impl Workload {
         {
             ignored.push("imagePullSecret");
         }
+        // Recorded by `from_deployment` rather than present in the spec: a
+        // replica count a single host cannot honour. `1` is what this host
+        // does, so it is not worth an event.
+        if self
+            .metadata
+            .annotations
+            .get(ANNOTATION_REPLICAS)
+            .is_some_and(|r| r != "1")
+        {
+            ignored.push("spec.replicas");
+        }
+        // Whatever else the deployment envelope carried. Static strings, so
+        // this matches on the two the envelope can name rather than echoing
+        // the annotation back.
+        if let Some(fields) = self.metadata.annotations.get(ANNOTATION_UNSUPPORTED_FIELDS) {
+            for field in fields.split(',') {
+                match field.trim() {
+                    "spec.artifacts" => ignored.push("spec.artifacts"),
+                    "spec.deployPolicy" => ignored.push("spec.deployPolicy"),
+                    "spec.kubernetes" => ignored.push("spec.kubernetes"),
+                    _ => {}
+                }
+            }
+        }
         ignored
     }
+}
+
+/// The first component name that appears more than once, if any.
+///
+/// A workload's grants name its components (`components: [<name>]` on a
+/// session, chat or inference binding), so two components of one name would
+/// both match: a second `{name: "agent", image: <anything>}` would be handed
+/// the agent's conversation store and inference. Every path that accepts a
+/// workload refuses one (apply, a washlet push, and the start-time mapping
+/// for a spec stored before this check).
+pub fn duplicate_component_name<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    names.into_iter().find(|n| !seen.insert(*n))
+}
+
+/// The refusal for [`duplicate_component_name`].
+pub fn duplicate_component_message(name: &str) -> String {
+    format!(
+        "component name {name:?} is used more than once; each component of a workload needs its \
+         own name, since grants name components"
+    )
 }
 
 /// True if `s` is a valid DNS label: non-empty, ≤63 chars, lowercase alnum +
@@ -735,5 +1092,341 @@ mod tests {
         let mut bad = w.clone();
         bad.spec.service.as_mut().unwrap().image = String::new();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn a_service_only_workload_is_valid_and_an_empty_one_is_not() {
+        // The Kafka pull-service shape: a `wasi:cli/run` component and nothing
+        // invoked alongside it. `components` may be omitted entirely.
+        let json = r#"{
+            "apiVersion": "runtime.wasmcloud.dev/v1alpha1",
+            "kind": "Workload",
+            "metadata": { "name": "pipeline", "namespace": "default" },
+            "spec": {
+                "service": { "image": "ghcr.io/acme/pull-service:1.0.0", "maxRestarts": 100 }
+            }
+        }"#;
+        let w: Workload = serde_json::from_str(json).unwrap();
+        assert!(w.spec.components.is_empty());
+        w.validate().unwrap();
+
+        let built = Workload::single_service(
+            "pipeline",
+            "default",
+            "ghcr.io/acme/pull-service:1.0.0".into(),
+            Vec::new(),
+            None,
+        );
+        built.validate().unwrap();
+        let svc = built.spec.service.as_ref().unwrap();
+        assert_eq!(svc.name, None, "a draft's service stays unnamed (portable)");
+        assert_eq!(
+            built.images().collect::<Vec<_>>(),
+            ["ghcr.io/acme/pull-service:1.0.0"]
+        );
+
+        let mut empty = w;
+        empty.spec.service = None;
+        let errs = empty.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("at least one component or a service")),
+            "{errs:?}"
+        );
+    }
+
+    /// Two components of one name would both match a grant naming it, so a
+    /// workload carrying them is refused.
+    #[test]
+    fn a_workload_with_two_components_of_one_name_is_refused() {
+        let json = r#"{
+            "apiVersion": "runtime.wasmcloud.dev/v1alpha1",
+            "kind": "Workload",
+            "metadata": { "name": "agent-session-x", "namespace": "default" },
+            "spec": {
+                "components": [
+                    { "name": "agent", "image": "ghcr.io/cosmonic/agents/goose:1.0.0" },
+                    { "name": "tools", "image": "ghcr.io/cosmonic/agents/tools:1.0.0" },
+                    { "name": "agent", "image": "ghcr.io/evil/impostor:1.0.0" }
+                ]
+            }
+        }"#;
+        let w: Workload = serde_json::from_str(json).unwrap();
+        let errs = w.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("\"agent\" is used more than once")), "{errs:?}");
+        let mut unique = w;
+        unique.spec.components.pop();
+        unique.validate().unwrap();
+        assert_eq!(duplicate_component_name(["a", "b", "a"]), Some("a"));
+        assert_eq!(duplicate_component_name(["a", "b"]), None);
+    }
+
+    /// The shape every Control manifest, kubectl example and template's
+    /// Kubernetes file has. Refusing it was the most common way an apply
+    /// failed, so these pin the acceptance rather than the refusal.
+    mod from_manifest {
+        use super::super::*;
+        use serde_json::json;
+
+        fn deployment(spec_extra: serde_json::Value) -> serde_json::Value {
+            let mut spec = json!({
+                "replicas": 1,
+                "template": {
+                    "spec": {
+                        "components": [{ "name": "app", "image": "ghcr.io/x/app:1" }]
+                    }
+                }
+            });
+            if let (Some(a), Some(b)) = (spec.as_object_mut(), spec_extra.as_object()) {
+                for (k, v) in b {
+                    a.insert(k.clone(), v.clone());
+                }
+            }
+            json!({
+                "apiVersion": API_VERSION,
+                "kind": KIND_WORKLOAD_DEPLOYMENT,
+                "metadata": { "name": "app", "namespace": "default" },
+                "spec": spec,
+            })
+        }
+
+        #[test]
+        fn unwraps_a_deployment_into_a_runnable_workload() {
+            let (w, notes) = Workload::from_manifest(deployment(json!({}))).unwrap();
+            assert_eq!(w.kind, KIND_WORKLOAD);
+            assert_eq!(w.metadata.name, "app");
+            assert_eq!(w.spec.components[0].image, "ghcr.io/x/app:1");
+            w.validate().expect("the unwrapped workload is applyable");
+            // The conversion is recorded on the workload, not announced as a
+            // warning: a warning on the happy path teaches people to skip
+            // warnings, and a replicas:1 Control manifest is the happy path.
+            assert_eq!(
+                w.metadata
+                    .annotations
+                    .get(ANNOTATION_FROM_KIND)
+                    .map(String::as_str),
+                Some(KIND_WORKLOAD_DEPLOYMENT)
+            );
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        #[test]
+        fn a_flat_workload_is_unchanged_and_gains_no_notes() {
+            let flat = json!({
+                "apiVersion": API_VERSION,
+                "kind": KIND_WORKLOAD,
+                "metadata": { "name": "app", "namespace": "default" },
+                "spec": { "components": [{ "name": "app", "image": "ghcr.io/x/app:1" }] },
+            });
+            let (w, notes) = Workload::from_manifest(flat).unwrap();
+            assert_eq!(w.kind, KIND_WORKLOAD);
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        #[test]
+        fn replicas_beyond_one_are_recorded_and_reported_at_apply() {
+            let (w, notes) = Workload::from_manifest(deployment(json!({ "replicas": 3 }))).unwrap();
+            assert_eq!(
+                w.metadata
+                    .annotations
+                    .get(ANNOTATION_REPLICAS)
+                    .map(String::as_str),
+                Some("3")
+            );
+            // The channel apply actually reads. Notes alone never reach it.
+            assert!(
+                w.ignored_portability_fields().contains(&"spec.replicas"),
+                "{:?}",
+                w.ignored_portability_fields()
+            );
+            assert!(
+                notes.iter().any(|n| n.contains("one instance runs")),
+                "{notes:?}"
+            );
+        }
+
+        #[test]
+        fn one_replica_is_what_this_host_does_and_earns_no_event() {
+            let (w, notes) = Workload::from_manifest(deployment(json!({ "replicas": 1 }))).unwrap();
+            assert!(!w.ignored_portability_fields().contains(&"spec.replicas"));
+            assert!(notes.is_empty(), "{notes:?}");
+            assert!(w.enabled());
+        }
+
+        #[test]
+        fn zero_replicas_applies_the_workload_stopped() {
+            let (w, notes) = Workload::from_manifest(deployment(json!({ "replicas": 0 }))).unwrap();
+            assert!(
+                !w.enabled(),
+                "replicas: 0 asks a cluster to run none of these"
+            );
+            assert!(notes.iter().any(|n| n.contains("applied")), "{notes:?}");
+        }
+
+        /// `as_u64` silently ignored every one of these, which are exactly the
+        /// inputs odd enough to deserve an answer.
+        #[test]
+        fn a_replica_count_that_is_not_a_whole_number_is_an_error() {
+            for bad in [json!("0"), json!(2.5), json!(-1)] {
+                let doc = deployment(json!({ "replicas": bad.clone() }));
+                let r = Workload::from_manifest(doc);
+                if bad == json!(-1) {
+                    // Parses as an integer; caught as a count, not a type.
+                    let (_, notes) = r.expect("-1 parses");
+                    assert!(
+                        notes.iter().any(|n| n.contains("one instance runs")),
+                        "{notes:?}"
+                    );
+                } else {
+                    assert!(r.is_err(), "replicas: {bad} should not be silently ignored");
+                }
+            }
+        }
+
+        /// A `Value` walk takes the last duplicate silently. On an endpoint
+        /// guarded by namespace, that is a parser differential.
+        /// `serde_json::Value` merges duplicates last-wins before any derived
+        /// `Deserialize` runs, so reading from a Value would silently pick a
+        /// namespace the author did not write. The slice form is the strict
+        /// one, and it is what the HTTP handlers use.
+        #[test]
+        fn a_duplicate_key_is_refused_rather_than_last_wins() {
+            let raw = r#"{"apiVersion":"runtime.wasmcloud.dev/v1alpha1","kind":"WorkloadDeployment",
+                "metadata":{"name":"app","namespace":"sys-platform"},
+                "metadata":{"name":"app","namespace":"default"},
+                "spec":{"template":{"spec":{"components":[{"name":"a","image":"x:1"}]}}}}"#;
+            // What a Value-based read would have decided: the last one.
+            let lenient: serde_json::Value = serde_json::from_str(raw).expect("json parses");
+            assert_eq!(lenient["metadata"]["namespace"], "default");
+
+            // What the handlers actually do.
+            let errs = Workload::from_manifest_slice(raw.as_bytes()).unwrap_err();
+            assert!(errs[0].contains("duplicate"), "{errs:?}");
+        }
+
+        #[test]
+        fn a_flat_workload_with_a_duplicate_key_is_refused_too() {
+            let raw = r#"{"apiVersion":"runtime.wasmcloud.dev/v1alpha1","kind":"Workload",
+                "metadata":{"name":"a","namespace":"sys-platform"},
+                "metadata":{"name":"a","namespace":"default"},
+                "spec":{"components":[{"name":"a","image":"x:1"}]}}"#;
+            let errs = Workload::from_manifest_slice(raw.as_bytes()).unwrap_err();
+            assert!(errs[0].contains("duplicate"), "{errs:?}");
+        }
+
+        /// The envelope must not launder an apiVersion past the check that
+        /// exists to catch it.
+        #[test]
+        fn a_deployment_without_an_apiversion_is_still_judged() {
+            let doc = json!({
+                "kind": KIND_WORKLOAD_DEPLOYMENT,
+                "metadata": { "name": "app", "namespace": "default" },
+                "spec": { "template": { "spec": {
+                    "components": [{ "name": "app", "image": "x:1" }] } } },
+            });
+            assert!(
+                Workload::from_manifest(doc).is_err(),
+                "a missing apiVersion must not be defaulted into validity"
+            );
+        }
+
+        #[test]
+        fn the_k8s_habit_location_for_labels_is_reported() {
+            let mut doc = deployment(json!({}));
+            doc["spec"]["template"]["metadata"] = json!({ "labels": { "a": "b" } });
+            let (w, notes) = Workload::from_manifest(doc).unwrap();
+            assert!(w.metadata.labels.is_empty());
+            assert!(
+                notes.iter().any(|n| n.contains("spec.template.metadata")),
+                "{notes:?}"
+            );
+        }
+
+        #[test]
+        fn the_operators_service_dns_is_reported() {
+            let doc = deployment(json!({ "kubernetes": { "service": { "name": "x" } } }));
+            let (w, notes) = Workload::from_manifest(doc).unwrap();
+            assert!(w.ignored_portability_fields().contains(&"spec.kubernetes"));
+            assert!(notes.iter().any(|n| n.contains("Service DNS")), "{notes:?}");
+        }
+
+        #[test]
+        fn the_cluster_only_fields_are_reported_not_dropped() {
+            let doc = deployment(json!({
+                "artifacts": [{ "name": "a" }],
+                "deployPolicy": { "strategy": "RollingUpdate" }
+            }));
+            let (w, notes) = Workload::from_manifest(doc).unwrap();
+            let ignored = w.ignored_portability_fields();
+            assert!(ignored.contains(&"spec.artifacts"), "{ignored:?}");
+            assert!(ignored.contains(&"spec.deployPolicy"), "{ignored:?}");
+            assert!(notes.iter().any(|n| n.contains("Artifact")), "{notes:?}");
+        }
+
+        #[test]
+        fn the_kind_it_came_from_is_kept_for_the_round_trip() {
+            let (w, _) = Workload::from_manifest(deployment(json!({}))).unwrap();
+            assert_eq!(
+                w.metadata
+                    .annotations
+                    .get(ANNOTATION_FROM_KIND)
+                    .map(String::as_str),
+                Some(KIND_WORKLOAD_DEPLOYMENT)
+            );
+        }
+
+        /// A non-string label used to vanish, letting the deployment's value
+        /// win where the doc promises the template's does.
+        #[test]
+        fn a_non_string_label_is_an_error_not_a_silent_fallback() {
+            let mut doc = deployment(json!({}));
+            doc["spec"]["template"]["labels"] = json!({ "tier": 5 });
+            assert!(Workload::from_manifest(doc).is_err());
+        }
+
+        #[test]
+        fn a_deployment_without_the_nesting_says_which_level_is_missing() {
+            let doc = json!({
+                "apiVersion": API_VERSION,
+                "kind": KIND_WORKLOAD_DEPLOYMENT,
+                "metadata": { "name": "app" },
+                "spec": { "replicas": 1 },
+            });
+            let errs = Workload::from_manifest(doc).unwrap_err();
+            // serde names the missing field and its path, which is better
+            // than the three hand-written sentences this used to carry.
+            assert!(errs[0].contains("missing field `template`"), "{errs:?}");
+        }
+
+        #[test]
+        fn an_unknown_kind_still_reports_the_kind_rather_than_serde() {
+            let doc = json!({
+                "apiVersion": API_VERSION,
+                "kind": "HTTPTrigger",
+                "metadata": { "name": "app", "namespace": "default" },
+                "spec": { "components": [{ "name": "app", "image": "ghcr.io/x/app:1" }] },
+            });
+            let (w, _) = Workload::from_manifest(doc).unwrap();
+            let errs = w.validate().unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("unsupported kind")),
+                "{errs:?}"
+            );
+        }
+
+        /// Rust eats the newline and the next line's indentation after a `\`,
+        /// so these read as one sentence. The sibling guard in api.rs covers
+        /// the same hazard for validate's warnings.
+        #[test]
+        fn the_messages_are_single_spaced() {
+            let doc = json!({
+                "apiVersion": API_VERSION,
+                "kind": KIND_WORKLOAD_DEPLOYMENT,
+                "metadata": { "name": "app" },
+                "spec": { "template": {} },
+            });
+            let errs = Workload::from_manifest(doc).unwrap_err();
+            assert!(!errs[0].contains("  "), "{:?}", errs[0]);
+        }
     }
 }

@@ -250,11 +250,11 @@ partition, capped at 64 calls in flight per component, so a replica's useful con
 `poolSize: 4` for the HTTP producer. `localResources.allowedHosts: []` — the plugin dials the
 broker, not the guest.
 
-## Rust idioms (wit-bindgen 0.58, `generate!({ world, generate_all })`)
+## Rust idioms (wit-bindgen 0.62, `generate!({ world, generate_all })`)
 
 - **The world name is the pattern's** (`kafka-handler-consumer`, `http-kafka-producer`,
   `kafka-pull-service`, `kafka-transactional`), not the project's; only the crate is renamed
-  by the scaffold. `Cargo.toml`: `wit-bindgen = { version = "0.58.0", features = ["macros",
+  by the scaffold. `Cargo.toml`: `wit-bindgen = { version = "0.62.0", features = ["macros",
   "async-spawn", "inter-task-wakeup"] }`, `crate-type = ["cdylib"]`, `edition = "2024"`,
   `cargo build --target wasm32-wasip2 --release`.
 - **Producer**: `use bindings::cosmonic::kafka::producer;` then `producer::send(topic,

@@ -4,7 +4,7 @@ description: Build and run MCP servers, HTTP APIs, web UIs, webhooks, background
 license: Apache-2.0
 compatibility: Requires Cosmonic Desktop with its `cosmonic` MCP server registered in the agent (Desktop's Settings → MCP Server). Desktop's Preflight doctor provisions the Rust build toolchain (`rustc`, the `wasm32-wasip2` target, `wash`, `wkg`); Go and TypeScript are not provisioned (Go needs Go 1.25+ plus `componentize-go`, per the cosmonic-go skill; the `-airgap` installer's Go module bundles both). Network is used only for `wash new` and crate fetches (see "Air-gapped installations").
 metadata:
-  version: '1.2.0'
+  version: '1.2.1'
   author: Cosmonic
 ---
 
@@ -205,6 +205,9 @@ component) do you link them with `wac` before deploying — `references/composit
 compose-then-deploy recipe and, more importantly, when *not* to compose.
 
 ### 4. Build
+
+If the project's `Cargo.toml` (or `Cargo.lock`) has `wasip3` 0.7.x, or `wit-bindgen` 0.58 or older
+with `inter-task-wakeup`, read `references/upgrading-p3-async-runtime.md` before building.
 
 - **Path A:** `cosmonic_dev_start(project_id="<id>")` builds, runs locally, watches for changes, and returns a
   local dev URL. Tail failures with `cosmonic_dev_logs`. Iterate until it serves.
