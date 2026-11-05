@@ -4,7 +4,7 @@ description: Build a Kafka-driven WebAssembly component for Cosmonic on the cosm
 license: Apache-2.0
 compatibility: Requires Cosmonic Desktop with the `cosmonic` MCP server to scaffold, build and publish (Rust with the wasm32-wasip2 target) and a host serving cosmonic:kafka@0.5.0 to run — Cosmonic Desktop compiles in Cosmonic Control's plugin-kafka (the default `kafka` feature), and Cosmonic Control 0.11+ on wasmCloud v2.9 serves the same. Needs a Kafka-protocol broker the host can reach, with the topics the manifest names already created.
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
   author: Cosmonic
   upstream: "templates from cosmonic-labs/awesome-cosmonic components/kafka @ f5326286 (the set Cosmonic Desktop vendors); binding rules from cosmonic/desktop daemon/docs/KAFKA.md and Control's plugin-kafka; the measured numbers from the cosmonic/kafka-demos campaign on the 0.3.0 driver, kept where the mechanism is unchanged"
 ---
@@ -48,7 +48,7 @@ running (§6).
   commits), and for `transaction` only when outputs and offsets must commit atomically.
   Never open a pull consumer per invocation: it is a stateful group member (64 per component).
 - **Async-only WASI p3.** Every function in the package is an `async func`. Rust needs
-  wit-bindgen ≥ 0.58 with `async-spawn` + `inter-task-wakeup` on `wasm32-wasip2`. TinyGo
+  wit-bindgen 0.62.0 with `async-spawn` + `inter-task-wakeup` on `wasm32-wasip2`. TinyGo
   cannot bind it; there is no Go set (componentize-go is the candidate, not shipped).
 - **Malformed input is `permanent`, never a panic.** A trap is retried like a transient
   error; five consecutive traps on one record dead-letter it, and until then that
@@ -111,7 +111,11 @@ wit/world.wit + wit/deps/cosmonic-kafka-0.5.0/package.wit   vendored; no registr
 wkg.lock + wkg-registries.toml   to re-fetch the WIT (`WKG_CONFIG_FILE=./wkg-registries.toml wash wit fetch`)
 ```
 
-Handler shape (wit-bindgen 0.58, `generate!({ world: "kafka-handler-consumer", generate_all })`;
+If the project's `Cargo.toml` (or `Cargo.lock`) has `wit-bindgen` 0.58 or older with
+`inter-task-wakeup`, read `cosmonic-sandbox`'s `references/upgrading-p3-async-runtime.md` before
+building.
+
+Handler shape (wit-bindgen 0.62, `generate!({ world: "kafka-handler-consumer", generate_all })`;
 the world name stays the pattern's — only the crate is renamed):
 
 ```rust

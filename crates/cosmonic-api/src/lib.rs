@@ -3,6 +3,9 @@
 //! These types are the wire contract between the daemon and its clients
 //! (Electron app, future CLI). See docs/ARCHITECTURE.md §3.3.
 
+/// GENERATED — the vendored Hugging Face agent-harness registry
+/// (`js/packages/scripts/vendor-agent-harnesses.mjs`); consumed by [`telemetry`].
+mod agent_harnesses;
 pub mod telemetry;
 pub mod workload;
 
@@ -41,7 +44,7 @@ pub struct HostInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_version: Option<String>,
     /// Version-bump-invariant hash of the daemon's source tree, baked at
-    /// build time (COSMONIC_DAEMON_SRC_HASH — scripts/daemon-src-hash.mjs).
+    /// build time (COSMONIC_DAEMON_SRC_HASH — js/packages/scripts/daemon-src-hash.mjs).
     /// The app compares it to its bundled daemon's hash to decide whether an
     /// "update daemon" restart would actually change anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,7 +106,7 @@ pub struct HostInfo {
     /// The `wasmcloud:nats` declaration the host was built with, as a label:
     /// default servers + `workloadConfig` policy + binding names (e.g.
     /// `nats://127.0.0.1:4222 (allow)`) — never a credential. Details on
-    /// `GET /v1/nats` (daemon/docs/NATS.md). Absent on older daemons.
+    /// `GET /v1/nats` (rust/docs/NATS.md). Absent on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nats: Option<String>,
     /// The `cosmonic:kafka` defaults the host was built with, as a label:
@@ -111,7 +114,7 @@ pub struct HostInfo {
     /// workload may override it), else `no default broker`, then `, bindings:
     /// a,b` for the named bindings it has defaults for; or `not in this build`
     /// for a daemon built without the Kafka plugin — never an address or a
-    /// credential (daemon/docs/KAFKA.md). Absent on older daemons.
+    /// credential (rust/docs/KAFKA.md). Absent on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka: Option<String>,
 
@@ -268,15 +271,21 @@ pub struct OciPruneSkip {
 /// cosmonicd process on this machine (Host tab "other hosts").
 ///
 /// Discovery scans the process table (sysinfo) for processes named
-/// `cosmonicd`, excluding this one. It is intentionally cheap and lossy. The
-/// HTTP ingress address and unix control socket path are recovered, best
-/// effort, from the process's command line (e.g. `COSMONIC_HTTP_ADDR`) and —
-/// when absent there (the common case, since they come from the inherited
-/// environment) — from one `lsof -nP -p <pid>` call per discovered pid (the
-/// TCP `LISTEN` line and the `*/cosmonicd.sock` unix entry). lsof is run on
-/// request only, never on a background loop. macOS/Linux only: Windows has no
-/// lsof, so there these fields stay absent (the app can still show the pid).
-/// This is a discovery hint for the UI, not an authoritative inventory.
+/// `cosmonicd` (`cosmonicd.exe` on Windows) run by this user, excluding this
+/// one, threads, exited ones not yet reaped (zombies), and any whose
+/// subcommand is not `run` (or absent, the default) — `cosmonicd mcp serve`
+/// and the other CLI subcommands are not hosts, and another user's daemon is
+/// not reachable (its socket dir is 0700). It is intentionally cheap and
+/// lossy. The HTTP ingress address and unix control socket path are
+/// recovered, best effort, from the process's command line (e.g.
+/// `COSMONIC_HTTP_ADDR`) and — when absent there (the common case, since they
+/// come from the inherited environment) — from one `lsof -nP -b -w -p <pid>`
+/// call per discovered pid (the TCP `LISTEN` line and the `*/cosmonicd.sock`
+/// unix entry). lsof is run on request only, never on a background loop, and
+/// is bounded: a call past 3 s is killed, so a slow machine leaves these
+/// fields absent rather than stalling the API. macOS/Linux only: Windows has
+/// no lsof, so there these fields stay absent (the app can still show the
+/// pid). This is a discovery hint for the UI, not an authoritative inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredHost {
@@ -287,10 +296,12 @@ pub struct DiscoveredHost {
     /// Unix epoch seconds the process started, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
-    /// Workload HTTP ingress address, if recoverable from the process args.
+    /// Workload HTTP ingress address, if recoverable from the process args or
+    /// its open files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_addr: Option<String>,
-    /// Unix socket path, if recoverable from the process args.
+    /// Unix socket path, if recoverable from the process args or its open
+    /// files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket_path: Option<String>,
 }
@@ -337,6 +348,12 @@ pub struct ApiError {
 pub struct WorkloadSummary {
     pub workload: workload::Workload,
     pub status: WorkloadStatus,
+    /// What an apply changed in the spec, or noticed about it, in sentences
+    /// for the caller: a `cosmonic:agent` grant Desktop named for the
+    /// workload's only component, or one that names no component in a
+    /// workload of several. Only on an apply's response; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// One entry in a workload's deployment-revision history (k8s-style). Returned
@@ -396,6 +413,12 @@ pub struct WorkloadStatus {
     /// Content hash of the spec at `observed_revision`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_hash: Option<String>,
+    /// Content hash of the spec as stored: the DESIRED one, next to
+    /// `spec_hash`, the one serving. They differ while a new spec deploys, and
+    /// stay different when its deployment failed and the previous revision
+    /// kept serving, so a client can tell "applied" from "running".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_spec_hash: Option<String>,
     /// Consecutive crash-restarts attempted by the reconciler.
     #[serde(default)]
     pub restarts: u32,
@@ -435,6 +458,32 @@ pub struct WorkloadStatus {
     /// workload's artifacts. Absent until a start ran the policy check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Set when this Desktop's runtime cannot run one of the workload's
+    /// components as built (issue #705: a P3 async runtime from wit-bindgen
+    /// older than 0.59 traps on Wasmtime 48). Found by a static scan of the
+    /// component bytes at pull/start, or from the runtime's trap text when a
+    /// build escaped the scan. Detection only: the daemon never changes what
+    /// the workload runs because of it. Absent when nothing is known wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected: Option<WorkloadAffected>,
+}
+
+/// `status.affected`: why this host can't run a workload as built, in words a
+/// person and an agent can act on.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadAffected {
+    /// Stable cause code (`wit-bindgen-pre-0.59`).
+    pub cause: String,
+    /// The one sentence to show.
+    pub message: String,
+    /// Where the details and the fix are documented.
+    pub docs_url: String,
+    /// The component (or service) names affected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
+    /// `scan` (the component bytes) or `runtime` (the trap was observed).
+    pub detected_by: String,
 }
 
 /// Which kind of credential a [`CredentialStatus`] row describes.
@@ -846,6 +895,17 @@ pub struct SecretRefInfo {
     /// deleted through this API. Absent for every ordinary ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// Changes on every write to the ref (register, replace, rotate), so a
+    /// client can tell a key replaced under the same name from the one it
+    /// knew: the Models page drops a connection test that ran against an
+    /// older revision. A per-write token, never derived from the value. Absent
+    /// for a ref not written since this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// When the ref was last written (RFC 3339), for display. Absent like
+    /// `revision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 /// `POST /v1/secrets/refs` body. Registers `name` → `uri` in the daemon's
@@ -890,8 +950,10 @@ impl std::fmt::Debug for CreateSecretRefRequest {
 /// `POST /v1/secrets/refs` response: the registered ref plus the workloads
 /// (`<namespace>/<name>`) this registration woke — `resumed` were parked
 /// waiting for the ref and are now starting (always); `restarted` were
-/// running and were restarted (only with `restartDependents: true`). Both
-/// lists are always on the wire, empty included: the reply is the one
+/// running and were restarted (only with `restartDependents: true`);
+/// `deferred` were running and could NOT be restarted, so they still hold the
+/// old value until someone restarts them (a Warning event names each). All
+/// three lists are always on the wire, empty included: the reply is the one
 /// authoritative statement of what the daemon did, so a client never has to
 /// guess from a missing key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,6 +965,8 @@ pub struct CreateSecretRefResponse {
     pub resumed: Vec<String>,
     #[serde(default)]
     pub restarted: Vec<String>,
+    #[serde(default)]
+    pub deferred: Vec<String>,
 }
 
 // ---- /v1/console (ARCHITECTURE.md §8, ROADMAP M6) ---------------------------
@@ -1199,7 +1263,7 @@ pub struct EgressMeter {
     pub would_deny: u64,
 }
 
-// ---- /v1/nats (daemon/docs/NATS.md; wash-runtime v2.8.0+ `wasmcloud:nats`) ----
+// ---- /v1/nats (rust/docs/NATS.md; wash-runtime v2.8.0+ `wasmcloud:nats`) ----
 
 /// The address a `wasmcloud:nats` binding that names no `servers` dials by
 /// default: the NATS default port on the machine's own loopback.
@@ -1461,6 +1525,209 @@ pub struct NatsTestResult {
     /// A caveat on a success — e.g. the server did not require
     /// authentication, so the credential offered was never exercised (NATS
     /// ignores credentials when auth is off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+// ---- /v1/kafka (rust/docs/KAFKA.md; cosmonic:kafka on Control's plugin-kafka) ----
+
+/// One named `cosmonic:kafka` binding (`name: <binding>` on a workload's
+/// hostInterface — its `(implements <binding>)` label), layered over the
+/// top-level `config`/`secret_from`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaBinding {
+    /// librdkafka properties plus the plugin's own (`topics`, `handler.*`,
+    /// `dead-letter.topic`), spelled the way librdkafka reads them. Never a
+    /// credential VALUE.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Names of registered secret refs whose values join THIS binding's layer
+    /// at boot; each ref's target key is the credential it supplies
+    /// (`SASL_PASSWORD` → `sasl.password`, `SSL_KEY_PASSWORD`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+}
+
+/// `<state_dir>/kafka.yaml` — the operator's `cosmonic:kafka` DEFAULTS
+/// (`GET`/`PUT /v1/kafka`). A base a binding inherits and a workload's own
+/// `cosmonic:kafka` config overrides key by key. Baked into the host at boot,
+/// so a PUT takes effect on the next daemon restart; `GET` reports stored vs
+/// active. Every field optional; nothing declared is a valid file. Closed
+/// (`deny_unknown_fields`): a typo'd top-level key is refused, not ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaSettings {
+    /// Defaults for the unnamed binding, and the base under every named one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Registered secret refs whose VALUES join that layer at boot (names
+    /// only in the file; a ref must target a credential key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+    /// Defaults for named bindings (`(implements <name>)`), each over `config`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, KafkaBinding>,
+}
+
+/// `GET /v1/kafka`: stored vs active declaration plus boot-time diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaStatus {
+    /// What `<state_dir>/kafka.yaml` holds now — what the NEXT daemon start
+    /// uses, unless the machine layer's file is deployed (`managed`).
+    pub settings: KafkaSettings,
+    /// What the running host was built with (the machine layer's file when
+    /// one was deployed and valid at boot, else the user's as it was then).
+    pub active: KafkaSettings,
+    /// The enterprise machine layer's `kafka.yaml` replaced the user's file
+    /// for this boot (docs/MULTI-TENANCY.md §3): `settings` is stored but
+    /// dormant, and `active` is the machine's declaration.
+    #[serde(default)]
+    pub managed: bool,
+    /// Whether this build registers the plugin at all (the `kafka` cargo
+    /// feature). `false` = a `--no-default-features` daemon: the file is still
+    /// read and stored, but no workload can bind `cosmonic:kafka`.
+    #[serde(default)]
+    pub compiled_in: bool,
+    /// Secret refs the active declaration named that did not resolve at boot
+    /// (ref names + backend error; never values). A binding missing its
+    /// credential fails at connect with the broker's own authorization error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_errors: Vec<String>,
+}
+
+/// `POST /v1/kafka/test` body: open one librdkafka client from the daemon —
+/// the process that really dials at bind — fetch the cluster's metadata, and
+/// report what answered. A probe, not a save: nothing is persisted and the
+/// running host is not touched. Snake_case like [`KafkaSettings`], so the
+/// Settings → Built-in plugins → Kafka form can post what it holds.
+///
+/// Two shapes, one route:
+/// - **saved** — `draft: false`: test the STORED binding `name` (`""`/absent
+///   is the unnamed default) layered exactly as boot layers it — base
+///   literals, base refs, the binding's literals, the binding's refs — with
+///   the refs resolved the way boot resolves them.
+/// - **draft** — `draft: true`: `config`/`secret_from` are the layer the form
+///   holds and has not saved. With a non-empty `name` it is a NAMED draft and
+///   is laid over the stored base (`config`/`secret_from`), which is what the
+///   host will do with it once saved; with `""`/absent it is the whole layer.
+///
+/// A draft may carry a credential literally (`config."sasl.password"`); it is
+/// used for the one dial and dropped. `PUT /v1/kafka` still refuses it — the
+/// store's rule (values via `secret_from` only) is about what gets written to
+/// disk.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    /// Literal keys, as [`KafkaBinding::config`]. The plugin's own keys
+    /// (`topics`, `handler.*`) are read for the topic check and never handed
+    /// to librdkafka.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, String>,
+    /// Secret refs merged in last, as [`KafkaBinding::secret_from`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_from: Vec<String>,
+}
+
+// Manual Debug: a draft's `config` may carry a credential value.
+impl std::fmt::Debug for KafkaTestRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaTestRequest")
+            .field("name", &self.name)
+            .field("draft", &self.draft)
+            .field("config", &self.config.keys().collect::<Vec<_>>())
+            .field("secret_from", &self.secret_from)
+            .finish()
+    }
+}
+
+/// Where a failed probe stopped, coarsest first — what the UI colours and
+/// what the fix is: the declaration, the network, or the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaTestStage {
+    /// Nothing was dialed: no broker anywhere in the layer, a secret ref did
+    /// not resolve, librdkafka refused the configuration (an unknown
+    /// property, a mechanism this build lacks), or a broker is outside the
+    /// machine egress allow-list.
+    Resolve,
+    /// The dial itself failed: refused, timed out, DNS, or the TLS handshake.
+    Connect,
+    /// A broker answered and refused the credential (SASL failed).
+    Auth,
+}
+
+impl KafkaTestStage {
+    /// The wire spelling, for audit reasons and log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Connect => "connect",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+/// One topic the layer grants (`topics`, `handler.topics`, `dead-letter.topic`),
+/// as the cluster reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestTopic {
+    pub name: String,
+    /// The cluster has this topic (partition count on success).
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<u32>,
+}
+
+/// `POST /v1/kafka/test` response — always HTTP 200 (a probe's failure *is*
+/// its result; 400 is reserved for a malformed body). Never carries a
+/// credential value: every sentence is scrubbed against the values the probe
+/// resolved before it is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KafkaTestResult {
+    /// A broker answered the metadata request.
+    pub ok: bool,
+    /// The `bootstrap.servers` the probe dialed, after the base layer was
+    /// applied — what a binding would dial.
+    pub brokers: String,
+    /// `security.protocol` as the layer resolved it (librdkafka's spelling,
+    /// `PLAINTEXT` when unset).
+    pub security_protocol: String,
+    /// `sasl.mechanism`, when the protocol is a SASL one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_mechanism: Option<String>,
+    /// The protocol is `SSL` or `SASL_SSL`.
+    pub tls: bool,
+    /// Whether a credential VALUE was in the layer (a `sasl.password`, an
+    /// OAuth client secret, a key password — from a ref or a draft literal).
+    /// Names nothing; lets the UI say "offered a credential".
+    pub credential: bool,
+    /// On success: the metadata round trip in ms, excluding secret-ref
+    /// resolution. On failure: wall time until the probe gave up.
+    pub latency_ms: u64,
+    /// On success: how many brokers the cluster advertises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_count: Option<u32>,
+    /// On success: the broker that answered (`host:port`, as it names itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<String>,
+    /// On success: the cluster's topic count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_count: Option<u32>,
+    /// On success: every topic the layer grants, and whether it exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<KafkaTestTopic>,
+    /// On failure: where it stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<KafkaTestStage>,
+    /// On failure: one actionable sentence, safe to render verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// A caveat on a success — e.g. a granted topic is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -1978,27 +2245,31 @@ pub struct LogConfigState {
     pub otlp_status: OtlpStatus,
 }
 
-/// Which inference backend the host proxies `cosmonic:llm` to. All speak the
+/// Which inference backend the host proxies `cosmonic:agent` inference to. All speak the
 /// OpenAI Chat Completions wire schema; `ollama` is the batteries-included
 /// default, `openai` is the generic escape hatch (llama-server / vLLM / llm-d /
 /// a remote endpoint). The UI capability-gates pull/lifecycle off the backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum InferenceBackend {
     #[default]
     Ollama,
     Openai,
+    /// Anthropic's Messages API (`/v1/messages`, `x-api-key`), spoken
+    /// natively rather than through its OpenAI-compatible layer, which cannot
+    /// carry an opaque block and so breaks multi-turn (cosmonicd anthropic.rs).
+    Anthropic,
 }
 
 /// `GET`/`PUT /v1/llm/config` — the Models / inference configuration, persisted
-/// as `<state_dir>/llm.yaml`. The host serves `cosmonic:llm` (and the `wasi:llm`
+/// as `<state_dir>/llm.yaml`. The host serves `cosmonic:agent` inference (and the `wasi:llm`
 /// alias) to components by proxying to `base_url` over the OpenAI-compatible
 /// API. The daemon URL is editable without touching component bindings — the
-/// `cosmonic:llm` abstraction the components see is stable.
+/// `cosmonic:agent` inference abstraction the components see is stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Whether the host serves the built-in `cosmonic:llm` endpoint at all.
+    /// Whether the host serves the built-in `cosmonic:agent` inference endpoint at all.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// The inference backend (`ollama` default, or a generic `openai` endpoint).
@@ -2020,6 +2291,440 @@ pub struct LlmConfig {
     /// request. Capability-gated (Ollama supports it; a remote endpoint won't).
     #[serde(default = "default_true")]
     pub scale_to_zero: bool,
+    /// Names of registered secret refs (`POST /v1/secrets/refs`) supplying the
+    /// credential for `base_url`. Empty = send none, which is right for Ollama
+    /// and wrong for every hosted provider.
+    ///
+    /// Same shape and same discipline as [`NatsBinding::secret_from`] and
+    /// [`KafkaBinding::secret_from`]: NAMES, never values, and each ref's
+    /// registered TARGET KEY is the credential key it supplies. `cosmonic:agent` inference
+    /// reads one, `api-key`; a ref targeting anything else is refused and its
+    /// value is never read. The host resolves per call, so no key is written to
+    /// `llm.yaml`, none is returned by `GET /v1/llm/config`, and rotating one
+    /// takes effect on the next turn rather than the next restart.
+    #[serde(default)]
+    pub secret_from: Vec<String>,
+    /// Requests one workload may make to a REMOTE endpoint before the host
+    /// refuses. `0` = unlimited.
+    ///
+    /// Only remote: a loopback model costs nothing, so capping it would only
+    /// break local development. Counted per workload for the life of the daemon
+    /// and reset when the workload unbinds. The default exists so a runaway
+    /// agent loop against a billable endpoint is a log line rather than an
+    /// invoice; an operator who wants no cap has to say so.
+    #[serde(default = "default_remote_budget_requests")]
+    pub remote_budget_requests: u32,
+    /// Tokens (prompt + completion, as the backend reports them) one workload
+    /// may spend on a REMOTE endpoint before the host refuses. `0` = unlimited.
+    ///
+    /// Checked BEFORE a request and charged after it, so the stop is hard but
+    /// the request that crosses the line still completes: a limit cannot be
+    /// enforced on tokens nobody has counted yet.
+    #[serde(default = "default_remote_budget_tokens")]
+    pub remote_budget_tokens: u32,
+    /// Meter this source and hold it to the budgets even though it is on this
+    /// machine. For a local proxy (LiteLLM and the like) that forwards to paid
+    /// services: loopback is otherwise treated as free.
+    #[serde(default)]
+    pub metered: bool,
+    /// What this source costs, as the operator entered it, for showing a
+    /// reply's cost. Display only: budgets count tokens, not money. `None`
+    /// shows tokens alone.
+    #[serde(default)]
+    pub price: Option<LlmPrice>,
+    /// The context window, in tokens, the host asks an OLLAMA source to run
+    /// its models with (`options.num_ctx` on every request). `None` takes the
+    /// automatic value: the smaller of the model's trained maximum and a size
+    /// picked from this machine's memory. Ignored by every other kind.
+    ///
+    /// Other apps that ask the same Ollama for a different value make it
+    /// reload the model, so this is one stable number, not a per-request one.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// Additional backends by name, the way `nats.yaml` carries named clusters.
+    ///
+    /// The flat fields above stay as the DEFAULT backend, so every `llm.yaml`
+    /// and every `PUT /v1/llm/config` written before this map existed keeps
+    /// working and keeps meaning the same thing. A workload that names no
+    /// backend gets the default; one whose `cosmonic:agent` inference entry sets
+    /// `config: { backend: <name> }` gets that entry from here.
+    ///
+    /// This is what lets one agent run against Anthropic while another runs
+    /// against OpenAI on the same host.
+    #[serde(default)]
+    pub backends: BTreeMap<String, LlmBackend>,
+}
+
+/// One inference backend the operator has configured: where it is, what it costs
+/// to reach, and what a workload gets from it by default.
+///
+/// A map of these is what makes two agents on two providers possible. A workload
+/// selects one BY NAME on its `cosmonic:agent` inference hostInterface; it cannot describe
+/// one. That keeps the property the endpoint guard exists for: the address is
+/// always the operator's, and a workload only chooses among addresses the
+/// operator already approved. Choosing from a list is not the same act as naming
+/// an arbitrary host, which is the line the attachment-URL refusal also draws.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmBackend {
+    /// What kind of endpoint this is, which decides how the host talks to it.
+    /// Named `kind` rather than `backend` because a "backend" is now one of
+    /// these whole bundles; this is the protocol it speaks.
+    #[serde(default)]
+    pub kind: InferenceBackend,
+    /// OpenAI-compatible base URL. Empty takes the kind's default (Ollama's
+    /// loopback root); an `openai` kind with nothing set cannot serve.
+    #[serde(default)]
+    pub base_url: String,
+    /// What an alias resolves to here when the workload names no model itself.
+    #[serde(default)]
+    pub default_model: String,
+    /// Registered secret-ref names supplying this backend's credential. NAMES,
+    /// never values, each targeting `api-key`. Same terms as
+    /// [`LlmConfig::secret_from`].
+    #[serde(default)]
+    pub secret_from: Vec<String>,
+    /// Per-workload limits for THIS backend. `0` = unlimited. A workload may
+    /// narrow them with `max-requests`/`max-tokens` and never widen them.
+    #[serde(default = "default_remote_budget_requests")]
+    pub remote_budget_requests: u32,
+    #[serde(default = "default_remote_budget_tokens")]
+    pub remote_budget_tokens: u32,
+    /// Same as [`LlmConfig::metered`], for this backend.
+    #[serde(default)]
+    pub metered: bool,
+    /// Same as [`LlmConfig::price`], for this backend.
+    #[serde(default)]
+    pub price: Option<LlmPrice>,
+    /// Same as [`LlmConfig::context_length`], for this backend.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+}
+
+/// A model source's price per million tokens, in millionths of a US dollar
+/// (so $3.00 is `3_000_000`): whole numbers, so a price compares and round
+/// trips exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmPrice {
+    pub input_per_mtok_micros: u64,
+    pub output_per_mtok_micros: u64,
+}
+
+/// `PUT /v1/llm/config` body. Every field is REQUIRED, which is the whole point
+/// of it existing separately from [`LlmConfig`].
+///
+/// The stored type defaults every field so an `llm.yaml` written before a field
+/// existed still loads. Sharing that type with the write path meant an omitted
+/// field was not a 422 but a silent RESET — and the defaults are not "unchanged":
+/// `enabled` and `scale_to_zero` become true, the budgets become 500 and
+/// 1,000,000 (widening a cap an operator tightened), `secret_from` empties so
+/// every later call goes out unauthenticated, and `backends` empties so named
+/// backends vanish.
+///
+/// That shape produced the same bug six times across three callers, each fixed
+/// at the call site, twice by someone who had just written a comment warning
+/// about it. Requiring the fields moves the failure from silent data loss to
+/// `422 missing field <name>` on the caller's first run.
+///
+/// A caller that wants "change one thing" reads the config, edits it, and sends
+/// it back. That round trip is why [`LlmConfig`]'s collection fields no longer
+/// carry `skip_serializing_if`: a GET that omitted `backends` when empty would
+/// fail its own PUT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutLlmConfigRequest {
+    pub enabled: bool,
+    pub backend: InferenceBackend,
+    pub base_url: String,
+    pub default_model: String,
+    pub keep_alive_secs: u32,
+    pub scale_to_zero: bool,
+    pub secret_from: Vec<String>,
+    pub remote_budget_requests: u32,
+    pub remote_budget_tokens: u32,
+    pub metered: bool,
+    /// Required like every field here (`null` for none): `deserialize_with`
+    /// stops serde treating a missing Option as `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub price: Option<LlmPrice>,
+    /// The one field here that is NOT required, because clients written
+    /// before it existed (the MCP app's bundled UI among them) PUT without
+    /// it. Three states, so absence cannot reset a window the operator chose:
+    /// absent keeps the stored value, `null` sets automatic, a number
+    /// overrides. Applied by [`PutLlmConfigRequest::into_config`].
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<Option<u32>>,
+    pub backends: BTreeMap<String, PutLlmBackend>,
+}
+
+/// One backend in a [`PutLlmConfigRequest`]. Required for the same reasons: an
+/// omitted `secret_from` here silently unauthenticates that one backend, which
+/// is harder to notice than the whole config losing its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutLlmBackend {
+    pub kind: InferenceBackend,
+    pub base_url: String,
+    pub default_model: String,
+    pub secret_from: Vec<String>,
+    pub remote_budget_requests: u32,
+    pub remote_budget_tokens: u32,
+    pub metered: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub price: Option<LlmPrice>,
+    /// Optional, three states, as [`PutLlmConfigRequest::context_length`]:
+    /// absent keeps the stored backend's value (by name), `null` is automatic.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<Option<u32>>,
+}
+
+/// A field that was present, as `Some` of its value (`Some(None)` for an
+/// explicit `null`). With `#[serde(default)]`, an absent field stays `None`,
+/// which is how "absent" and "null" are told apart.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl PutLlmConfigRequest {
+    /// The config to store, given the one stored now. Every field comes from
+    /// the request except an absent `context_length`, at the top level or on a
+    /// backend, which keeps `current`'s (a backend's by name; a new backend's
+    /// is automatic).
+    pub fn into_config(self, current: &LlmConfig) -> LlmConfig {
+        let backends = self
+            .backends
+            .into_iter()
+            .map(|(name, b)| {
+                let kept = current.backends.get(&name).and_then(|c| c.context_length);
+                let context_length = b.context_length.unwrap_or(kept);
+                let mut backend = LlmBackend::from(b);
+                backend.context_length = context_length;
+                (name, backend)
+            })
+            .collect();
+        LlmConfig {
+            enabled: self.enabled,
+            backend: self.backend,
+            base_url: self.base_url,
+            default_model: self.default_model,
+            keep_alive_secs: self.keep_alive_secs,
+            scale_to_zero: self.scale_to_zero,
+            secret_from: self.secret_from,
+            remote_budget_requests: self.remote_budget_requests,
+            remote_budget_tokens: self.remote_budget_tokens,
+            metered: self.metered,
+            price: self.price,
+            context_length: self.context_length.unwrap_or(current.context_length),
+            backends,
+        }
+    }
+}
+
+impl From<PutLlmBackend> for LlmBackend {
+    fn from(b: PutLlmBackend) -> Self {
+        Self {
+            kind: b.kind,
+            base_url: b.base_url,
+            default_model: b.default_model,
+            secret_from: b.secret_from,
+            remote_budget_requests: b.remote_budget_requests,
+            remote_budget_tokens: b.remote_budget_tokens,
+            metered: b.metered,
+            price: b.price,
+            // Absent is automatic here: a backend with no stored value to keep
+            // (a candidate under test). `into_config` keeps a stored one.
+            context_length: b.context_length.flatten(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod put_llm_config_request_tests {
+    use super::*;
+
+    const COMPLETE: &str = r#"{"enabled":true,"backend":"openai","base_url":"https://api.openai.com",
+        "default_model":"gpt-4o-mini","keep_alive_secs":300,"scale_to_zero":true,
+        "secret_from":["openai"],"remote_budget_requests":25,"remote_budget_tokens":1000,"metered":false,"price":null,"context_length":null,
+        "backends":{"demo":{"kind":"openai","base_url":"https://api.openai.com",
+        "default_model":"gpt-4o-mini","secret_from":["openai"],
+        "remote_budget_requests":25,"remote_budget_tokens":1000,"metered":false,
+        "price":{"input_per_mtok_micros":150000,"output_per_mtok_micros":600000},
+        "context_length":8192}}}"#;
+
+    /// Every field a caller can forget, and what forgetting it used to do.
+    ///
+    /// The point is not that these are invalid values — they are the DEFAULTS,
+    /// which is what made the old behaviour silent. Two of them fail open.
+    #[test]
+    fn an_omitted_field_is_refused_rather_than_reset() {
+        let whole: serde_json::Value = serde_json::from_str(COMPLETE).unwrap();
+        assert!(serde_json::from_value::<PutLlmConfigRequest>(whole.clone()).is_ok());
+
+        for field in [
+            "enabled",
+            "backend",
+            "base_url",
+            "default_model",
+            "keep_alive_secs",
+            "scale_to_zero",
+            "secret_from",
+            "remote_budget_requests",
+            "remote_budget_tokens",
+            "metered",
+            "price",
+            "backends",
+        ] {
+            let mut body = whole.clone();
+            body.as_object_mut().unwrap().remove(field);
+            let err = serde_json::from_value::<PutLlmConfigRequest>(body)
+                .expect_err(&format!("omitting {field} must be refused, not defaulted"));
+            assert!(
+                err.to_string().contains(field),
+                "the refusal names the field: {err}"
+            );
+        }
+    }
+
+    /// A named backend can lose its key just as quietly as the top level can.
+    #[test]
+    fn an_omitted_field_inside_a_backend_is_refused_too() {
+        let whole: serde_json::Value = serde_json::from_str(COMPLETE).unwrap();
+        for field in [
+            "kind",
+            "base_url",
+            "default_model",
+            "secret_from",
+            "remote_budget_requests",
+            "remote_budget_tokens",
+            "metered",
+            "price",
+        ] {
+            let mut body = whole.clone();
+            body["backends"]["demo"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<PutLlmConfigRequest>(body).is_err(),
+                "omitting backends.demo.{field} must be refused"
+            );
+        }
+    }
+
+    /// `context_length` is optional, with three states. Absent keeps what
+    /// is stored (an older client's save cannot reset a chosen window), null
+    /// is automatic, a number overrides; the same for each backend, by name.
+    #[test]
+    fn context_length_absent_keeps_null_clears_number_sets() {
+        let mut stored = LlmConfig { context_length: Some(16_384), ..LlmConfig::default() };
+        stored.backends.insert(
+            "demo".into(),
+            LlmBackend { context_length: Some(4096), ..LlmBackend::default() },
+        );
+        let whole: serde_json::Value = serde_json::from_str(COMPLETE).unwrap();
+        let apply = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut body = whole.clone();
+            edit(&mut body);
+            serde_json::from_value::<PutLlmConfigRequest>(body)
+                .expect("context_length is never required")
+                .into_config(&stored)
+        };
+
+        // Absent, top level and backend: both stored values survive.
+        let kept = apply(&|b| {
+            b.as_object_mut().unwrap().remove("context_length");
+            b["backends"]["demo"].as_object_mut().unwrap().remove("context_length");
+        });
+        assert_eq!(kept.context_length, Some(16_384));
+        assert_eq!(kept.backends["demo"].context_length, Some(4096));
+
+        // Explicit null: automatic.
+        let cleared = apply(&|b| {
+            b["context_length"] = serde_json::Value::Null;
+            b["backends"]["demo"]["context_length"] = serde_json::Value::Null;
+        });
+        assert_eq!(cleared.context_length, None);
+        assert_eq!(cleared.backends["demo"].context_length, None);
+
+        // A number: that number.
+        let set = apply(&|b| {
+            b["context_length"] = serde_json::json!(32_768);
+            b["backends"]["demo"]["context_length"] = serde_json::json!(8192);
+        });
+        assert_eq!(set.context_length, Some(32_768));
+        assert_eq!(set.backends["demo"].context_length, Some(8192));
+
+        // A new backend with the field absent has nothing to keep: automatic.
+        let added = apply(&|b| {
+            let mut fresh = b["backends"]["demo"].clone();
+            fresh.as_object_mut().unwrap().remove("context_length");
+            b["backends"]["fresh"] = fresh;
+        });
+        assert_eq!(added.backends["fresh"].context_length, None);
+
+        // A body from before the field existed still parses (the MCP app's).
+        let mut old = whole.clone();
+        old.as_object_mut().unwrap().remove("context_length");
+        let parsed: PutLlmConfigRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.context_length, None);
+        // And a request serializes absent as absent, null as null.
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert!(out.get("context_length").is_none());
+    }
+
+    /// The round trip the strictness would otherwise have broken.
+    ///
+    /// `LlmConfig`'s collection fields used to carry `skip_serializing_if`, so a
+    /// GET on a config with no backends omitted `backends` — and that response,
+    /// sent straight back, would have failed its own PUT. Read-edit-write is the
+    /// supported way to change one setting, so it has to survive.
+    #[test]
+    fn a_get_response_is_always_a_valid_put_body() {
+        for cfg in [
+            LlmConfig::default(),
+            LlmConfig {
+                secret_from: vec![],
+                backends: BTreeMap::new(),
+                ..LlmConfig::default()
+            },
+        ] {
+            let got = serde_json::to_value(&cfg).unwrap();
+            assert!(
+                got.get("backends").is_some() && got.get("secret_from").is_some(),
+                "GET must emit every field a PUT requires: {got}"
+            );
+            let back: PutLlmConfigRequest = serde_json::from_value(got)
+                .expect("a GET response round-trips into a PUT body unchanged");
+            assert_eq!(back.into_config(&LlmConfig::default()), cfg);
+        }
+    }
+}
+
+impl Default for LlmBackend {
+    fn default() -> Self {
+        Self {
+            kind: InferenceBackend::default(),
+            base_url: String::new(),
+            default_model: String::new(),
+            secret_from: Vec::new(),
+            remote_budget_requests: default_remote_budget_requests(),
+            remote_budget_tokens: default_remote_budget_tokens(),
+            metered: false,
+            price: None,
+            context_length: None,
+        }
+    }
+}
+
+/// Enough for a long agent session, far short of a surprise. Both are per
+/// workload, per daemon run.
+fn default_remote_budget_requests() -> u32 {
+    500
+}
+
+fn default_remote_budget_tokens() -> u32 {
+    1_000_000
 }
 
 fn default_true() -> bool {
@@ -2035,44 +2740,20 @@ impl Default for LlmConfig {
             default_model: String::new(),
             keep_alive_secs: 0,
             scale_to_zero: true,
+            secret_from: Vec::new(),
+            remote_budget_requests: default_remote_budget_requests(),
+            remote_budget_tokens: default_remote_budget_tokens(),
+            metered: false,
+            price: None,
+            context_length: None,
+            backends: BTreeMap::new(),
         }
     }
 }
 
-/// A model→workload binding: the host resolves `alias` (under `namespace`, on
-/// `link_name`) to `model` for the given workload/component. Persisted in
-/// `<state_dir>/llm-bindings.yaml`; this is the registry the host consults to
-/// satisfy a component's `cosmonic:llm` import per workload.
-///
-/// NOTE: fields (e.g. `link_name`) are deliberately snake_case (no
-/// `rename_all = "camelCase"`) — this is the wire format the JS client already
-/// reads/sends (screens_models.jsx) AND the persisted `llm-bindings.yaml` disk
-/// format; renaming would break both. Do not "normalize" it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmBinding {
-    /// Stable id (assigned by the store on create; ignored on POST).
-    #[serde(default)]
-    pub id: String,
-    /// The bound model name/alias, or `builtin` for the managed Cosmonic LLM.
-    pub model: String,
-    /// Target workload id.
-    pub workload: String,
-    /// Target component name; empty = all components in the workload.
-    #[serde(default)]
-    pub component: String,
-    /// WIT namespace the component imports (`cosmonic:llm` | `wasi:llm`).
-    pub namespace: String,
-    /// Link name.
-    #[serde(default)]
-    pub link_name: String,
-    /// The model alias the component requests (resolves to `model`).
-    #[serde(default)]
-    pub alias: String,
-}
-
 /// A locally-available model, as the Models UI table renders it. Sourced from
 /// the backend's catalog (`/api/tags`) merged with what's currently loaded
-/// (`/api/ps`). Fields are best-effort — absent ones are left empty/None.
+/// (`/api/ps`) and each model's `/api/show`. Fields are best-effort — absent ones are left empty/None.
 ///
 /// NOTE: multi-word fields (`size_bytes`, `context_length`, `vram_bytes`) are
 /// deliberately snake_case (no `rename_all = "camelCase"`); the JS client reads
@@ -2095,7 +2776,9 @@ pub struct LlmModelInfo {
     /// On-disk size in bytes.
     #[serde(default)]
     pub size_bytes: u64,
-    /// Context window length (tokens), when reported.
+    /// The model's trained maximum context (tokens), from Ollama's
+    /// `/api/show`; absent when it did not say. Not the window it is served
+    /// with, which the host sets per source (`LlmConfig::context_length`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u64>,
     /// Currently resident (loaded into memory / VRAM).
@@ -2106,22 +2789,162 @@ pub struct LlmModelInfo {
     pub vram_bytes: Option<u64>,
 }
 
+/// One part of a message, the JSON projection of the `cosmonic:agent` inference
+/// `content-part` variant. Tagged on `type`, matching how both OpenAI and
+/// Anthropic discriminate content blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmContentPart {
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        url: String,
+    },
+    ImageBytes {
+        media_type: String,
+        data: Vec<u8>,
+    },
+    /// A call the model made. Valid on an `assistant` message.
+    ToolUse {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    /// The answer to one call. Valid on a `tool` message.
+    ToolResult {
+        call_id: String,
+        output: Vec<LlmToolOutput>,
+        #[serde(default)]
+        is_error: bool,
+    },
+    /// A provider block this DTO does not model, round-tripped verbatim.
+    Other {
+        kind: String,
+        json: String,
+    },
+}
+
+/// What a tool returned. A leaf type rather than nested content parts: the WIT
+/// cannot express the recursion, and text-or-image is the real intersection of
+/// what OpenAI and Anthropic accept in a tool result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmToolOutput {
+    Text { text: String },
+    Image { media_type: String, data: Vec<u8> },
+}
+
+/// A message's content: either a plain string or a list of blocks.
+///
+/// The string form is what the Desktop chat UI sends and reads, so it stays
+/// accepted and is emitted whenever a message is text-only. Blocks are used the
+/// moment a turn carries a tool call or a tool result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LlmContent {
+    Text(String),
+    Blocks(Vec<LlmContentPart>),
+}
+
+impl Default for LlmContent {
+    fn default() -> Self {
+        LlmContent::Text(String::new())
+    }
+}
+
+impl LlmContent {
+    /// The content as blocks, promoting the string form to a single text block.
+    pub fn parts(&self) -> Vec<LlmContentPart> {
+        match self {
+            LlmContent::Text(text) => vec![LlmContentPart::Text { text: text.clone() }],
+            LlmContent::Blocks(parts) => parts.clone(),
+        }
+    }
+
+    /// Just the text, with non-text blocks skipped. For callers that only ever
+    /// wanted a string (the chat UI, logging).
+    pub fn text(&self) -> String {
+        match self {
+            LlmContent::Text(text) => text.clone(),
+            LlmContent::Blocks(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    LlmContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Collapse to the string form when nothing would be lost, so a plain
+    /// exchange serializes exactly as it did before blocks existed.
+    pub fn compact(self) -> Self {
+        match &self {
+            LlmContent::Blocks(parts)
+                if parts
+                    .iter()
+                    .all(|p| matches!(p, LlmContentPart::Text { .. })) =>
+            {
+                LlmContent::Text(self.text())
+            }
+            _ => self,
+        }
+    }
+}
+
+impl From<&str> for LlmContent {
+    fn from(text: &str) -> Self {
+        LlmContent::Text(text.to_string())
+    }
+}
+
 /// A chat message in the daemon's `/v1/llm/chat` DTO — the JSON projection of
-/// the `cosmonic:llm` `message` (text content; multimodal parts arrive later).
+/// the `cosmonic:agent` inference `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
-    pub content: String,
+    pub content: LlmContent,
+    /// OpenAI `messages[].name`, an author label. NOT how a tool result is
+    /// correlated: that is `LlmContentPart::ToolResult::call_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl LlmMessage {
+    /// A plain text message, the common case.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: LlmContent::Text(content.into()),
+            name: None,
+        }
+    }
+}
+
+/// A tool the model may call. Structured rather than an opaque OpenAI envelope:
+/// the host owns the translation, so a guest never authors one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmToolDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub description: String,
+    /// JSON Schema for the arguments, as a JSON string.
+    pub input_schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<String>,
 }
 
 /// `POST /v1/llm/chat` (and `/v1/llm/chat/stream`) body — the host's
 /// OpenAI-faithful chat request. `model` is an alias resolved by the host
-/// (falls back to the configured default model). Mirrors the `cosmonic:llm`
+/// (falls back to the configured default model). Mirrors the `cosmonic:agent` inference
 /// `request` shape the WIT interface carries.
 ///
 /// NOTE: `max_tokens` is deliberately snake_case (no `rename_all`) — it mirrors
 /// the OpenAI wire schema field name, which the JS client reads/sends as-is.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -2130,6 +2953,34 @@ pub struct LlmChatRequest {
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Tools the model may call. Empty means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<LlmToolDef>,
+    /// `auto` | `none` | `required` | a specific tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
+    /// OpenAI `response_format` object, carried as raw JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// The sampling knobs an OpenAI-compatible endpoint accepts.
+    ///
+    /// `cosmonic:agent` inference offers ten; these six are the ones OpenAI takes. The other
+    /// four (`top-k`, `min-p`, `repeat-penalty`, `penalty-last-n`) are
+    /// Ollama/llama.cpp vocabulary with no OpenAI equivalent, and the host
+    /// reports them as ignored rather than dropping them silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// Token id → bias, as OpenAI's `logit_bias` map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logit_bias: BTreeMap<String, f32>,
 }
 
 /// `POST /v1/llm/chat` response — a unary completion.
@@ -2140,13 +2991,52 @@ pub struct LlmChatRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmCompletion {
     pub model: String,
+    /// The assistant turn, whole. Append it to the conversation verbatim.
+    pub message: LlmMessage,
+    /// The text of `message`, derived. Kept on the HTTP DTO only, for clients
+    /// that predate blocks; the WIT deliberately has no such duplicate field.
     pub content: String,
     #[serde(default)]
     pub finish_reason: String,
+    /// Absent when the backend did not report it, which is NOT the same fact as
+    /// zero and must not be flattened into one. Several OpenAI-compatible
+    /// servers and most gateways omit `usage` on unary responses; a confident
+    /// zero there makes the token budget inert while still looking accounted
+    /// for, because `charge` adds nothing and the cap is never reached.
     #[serde(default)]
-    pub prompt_tokens: u32,
+    pub prompt_tokens: Option<u32>,
     #[serde(default)]
-    pub completion_tokens: u32,
+    pub completion_tokens: Option<u32>,
+    /// Of `prompt_tokens`, those read from the provider's prompt cache. Absent
+    /// when the backend did not split them out (OpenAI-compatible bodies are
+    /// not read for it). Already included in `prompt_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u32>,
+    /// Of `prompt_tokens`, those written into the provider's prompt cache.
+    /// Already included in `prompt_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
+    /// Tokens an attempt the host made and discarded spent (prompt and
+    /// output), such as a turn asked again because the model answered only
+    /// in its thinking. NOT in `prompt_tokens` or `completion_tokens`, which
+    /// stay the size of the call that answered (what fills the context);
+    /// counted toward spend only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_tokens: Option<u32>,
+}
+
+/// One tool call from an OpenAI `message.tool_calls[]` entry, flattened: the
+/// only `type` the wire format defines today is `function`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmToolCall {
+    /// Provider-assigned id, echoed back on the tool result that answers it.
+    /// Synthesized by the host when the backend mints none.
+    pub id: String,
+    pub name: String,
+    /// Arguments as a JSON object string. Passed through unparsed: models emit
+    /// malformed JSON here often enough that rejecting it in the host would
+    /// turn a recoverable prompt problem into a failed call.
+    pub arguments: String,
 }
 
 /// `GET /v1/host/config` response and `PUT /v1/host/config` body; persisted
@@ -2545,9 +3435,8 @@ impl Default for NotifyConfig {
     }
 }
 
-/// Rate-limit shape. Designed now, **not enforced in v1** — the service counts
-/// breaches and logs them so the numbers are real before anything is rejected
-/// (docs/NOTIFY.md §4.1).
+/// Notification rate limits, enforced: a send past the component's budget or
+/// the host's is refused with `throttled` and counted (docs/NOTIFY.md §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyLimits {
     /// Ceiling across every component on this host.

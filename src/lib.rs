@@ -51,3 +51,7 @@ pub const SERVER_NAME: &str = "cosmonic-desktop";
 
 /// This build's version.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod builder;
+mod ui;
+mod ui_content;

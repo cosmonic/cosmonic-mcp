@@ -49,9 +49,16 @@ pub struct CosmonicMcp {
     /// Which agent connected, as a fixed enum from [`catalog::MCP_CLIENTS`] —
     /// never the raw `clientInfo.name`, which the client controls and which
     /// routinely carries a path or a hostname. Set once, at `initialize`.
-    client_id: Arc<OnceLock<(&'static str, String)>>,
+    /// `(client, client_version_major, harness)` from the handshake — the
+    /// self-reported client and the harness detected from our own environment
+    /// (issue #527), kept for the disconnect event.
+    client_id: Arc<OnceLock<(&'static str, String, &'static str)>>,
     /// Tool calls in this session, for `mcp_client_disconnected`.
     tools_invoked: Arc<AtomicU64>,
+    /// Whether the client renders MCP Apps and keeps app-only tools away from
+    /// its model: it declared the extension (`io.modelcontextprotocol/ui`) at
+    /// `initialize`, or it is Codex, which does both without declaring it.
+    renders_apps: Arc<OnceLock<bool>>,
 }
 
 impl CosmonicMcp {
@@ -61,7 +68,19 @@ impl CosmonicMcp {
             tool_router: Self::tool_router(),
             client_id: Arc::new(OnceLock::new()),
             tools_invoked: Arc::new(AtomicU64::new(0)),
+            renders_apps: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// See [`Self::renders_apps`]; false until `initialize`.
+    pub(crate) fn renders_apps(&self) -> bool {
+        self.renders_apps.get().copied().unwrap_or(false)
+    }
+
+    /// The normalized client id (`codex`, `claude-desktop`, ...); None until
+    /// `initialize`.
+    pub(crate) fn client(&self) -> Option<&'static str> {
+        self.client_id.get().map(|(client, _, _)| *client)
     }
 
     /// Hand a product-telemetry event to the daemon, which owns the only
@@ -147,25 +166,30 @@ impl CosmonicMcp {
 /// The daemon's code + a recovery hint, with the one case the daemon leaves
 /// generic made specific here.
 ///
-/// A Workload body that does not deserialize comes back as a 422 whose code
-/// is the bare `error` and whose message is serde's — `missing field
-/// \`components\`` when the caller pasted a `WorkloadDeployment` /
-/// `HTTPTrigger` (the `spec.template.spec` nesting) instead of a flat
-/// `Workload`. That is by far the most common way an apply or validate fails
-/// to parse, and "Inspect the error message; check the logs" is not a
-/// recovery for it. The code becomes `invalid_workload` (what a 400 from the
-/// same tools already says) and the hint names the flattening.
+/// A `WorkloadDeployment` is no longer refused: the daemon unwraps
+/// `.spec.template.spec` and applies the workload inside it, so a Control
+/// manifest works here as written. This stays for the shapes that are still
+/// refused, and for an older daemon on the other end of the socket, which
+/// answers either a 400 naming the `kind` or a 422 whose code is the bare
+/// `error` and whose message is serde's `missing field \`components\``. Either
+/// way the code becomes `invalid_workload` and the hint names the flattening,
+/// which is the fix against a daemon that cannot do it itself.
 fn refine(code: String, status: u16, message: &str) -> (String, String) {
     let tool = CURRENT_TOOL.try_with(|t| t.clone()).unwrap_or_default();
     refine_for_tool(code, status, message, &tool)
 }
 
 fn refine_for_tool(code: String, status: u16, message: &str, tool: &str) -> (String, String) {
-    if status == 422 && subject_of(tool) == Subject::Workload {
-        let recovery = if message.contains("missing field `components`") {
-            "This is the nested `WorkloadDeployment` / `HTTPTrigger` shape. Apply a flat \
-             `Workload` with top-level `spec.components` and `spec.hostInterfaces` — the \
-             `cosmonic://schema/workload` resource has the shape and a worked example."
+    let nested = message.contains("missing field `components`")
+        || message.contains("unsupported kind \"WorkloadDeployment\"")
+        || message.contains("unsupported kind \"HTTPTrigger\"");
+    if (status == 422 || (status == 400 && nested)) && subject_of(tool) == Subject::Workload {
+        let recovery = if nested {
+            "This is the nested `WorkloadDeployment` / `HTTPTrigger` shape, and this host \
+             did not unwrap it. A current daemon accepts a `WorkloadDeployment` as written; \
+             this one is older, or the document is an `HTTPTrigger`. Apply a flat `Workload` \
+             with top-level `spec.components` (and/or `spec.service`) and `spec.hostInterfaces` \
+             — the `cosmonic://schema/workload` resource has the shape and a worked example."
                 .to_string()
         } else {
             recovery_for_tool("invalid_workload", 400, tool)
@@ -459,17 +483,37 @@ impl ServerHandler for CosmonicMcp {
     /// `clientInfo.name` is chosen by the client, so it is never sent as-is:
     /// [`catalog::normalize_mcp_client`] maps it onto a known agent or `other`,
     /// and only the MAJOR version travels.
+    ///
+    /// `harness` is the second, independent signal: the agent that spawned us
+    /// left its marker in the environment we inherited, and
+    /// [`cosmonic_api::telemetry::detect_agent_harness`] names it from a
+    /// vendored registry — presence-only, a fixed enum, never a value.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        let client = cosmonic_api::telemetry::normalize_mcp_client(&request.client_info.name);
+        let client = cosmonic_api::telemetry::normalize_mcp_client_info(
+            &request.client_info.name,
+            request.client_info.title.as_deref(),
+        );
         let version = cosmonic_api::telemetry::version_major(&request.client_info.version);
-        let _ = self.client_id.set((client, version.clone()));
+        let harness = cosmonic_api::telemetry::detect_agent_harness_from_env();
+        let _ = self.client_id.set((client, version.clone(), harness));
+        // Codex renders MCP Apps (and keeps `openai/visibility: private`
+        // tools from its model) without declaring the extension, so it is
+        // recognized by name too.
+        let _ = self.renders_apps.set(
+            client == "codex"
+                || request
+                    .capabilities
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|e| e.contains_key(crate::ui::EXTENSION)),
+        );
         self.track(
             "mcp_client_connected",
-            json!({ "client": client, "client_version_major": version }),
+            json!({ "client": client, "client_version_major": version, "harness": harness }),
         )
         .await;
 
@@ -505,19 +549,30 @@ impl ServerHandler for CosmonicMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self
+        let mut tools: Vec<Tool> = self
             .tool_router
             .list_all()
             .into_iter()
             .map(portable_tool)
             .collect();
+        // The workspace tools only mean something to a host that renders the
+        // app. A plain agent client (Claude Code, Cursor, ...) keeps the
+        // agent-facing surface the MCP contract test pins, without the
+        // workspace's app-only helpers (which switch on an `action`).
+        if self.renders_apps() {
+            tools.extend(crate::ui::tools());
+        }
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(STATIC_LIST_TTL_MS)
             .with_cache_scope(CacheScope::Public))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.tool_router.get(name).cloned()
+        crate::ui::tools()
+            .into_iter()
+            .filter(|_| self.renders_apps())
+            .find(|t| t.name == name)
+            .or_else(|| self.tool_router.get(name).cloned())
     }
 
     async fn call_tool(
@@ -527,6 +582,17 @@ impl ServerHandler for CosmonicMcp {
     ) -> Result<CallToolResponse, McpError> {
         // Capture the tool name for the whole dispatch so the daemon client tags
         // its requests with it (usage analytics — see CURRENT_TOOL).
+        if crate::ui::is_tool(&request.name) {
+            if !self.renders_apps() {
+                return Err(McpError::invalid_params(
+                    format!("unknown tool: {}", request.name),
+                    None,
+                ));
+            }
+            return crate::ui::call(self, &request.name, request.arguments)
+                .await
+                .map(Into::into);
+        }
         let tool = request.name.to_string();
         self.tools_invoked.fetch_add(1, Ordering::Relaxed);
         let tcc = ToolCallContext::new(self, request, context);
@@ -558,6 +624,9 @@ impl ServerHandler for CosmonicMcp {
             .collect();
         // Skills over MCP — the catalog first, then the playbooks it indexes.
         list.extend(skills::resources());
+        list.push(
+            Resource::new(crate::ui::uri(), "Cosmonic Desktop").with_mime_type(crate::ui::MIME),
+        );
         Ok(ListResourcesResult::with_all_items(list)
             .with_ttl_ms(FLAGGED_LIST_TTL_MS)
             .with_cache_scope(CacheScope::Private))
@@ -569,6 +638,13 @@ impl ServerHandler for CosmonicMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.as_str();
+        if crate::ui::is_uri(uri) {
+            tracing::info!(client = ?self.client(), "serving the workspace UI");
+            return Ok(ReadResourceResult::new(vec![crate::ui::resource(uri)])
+                .with_ttl_ms(STATIC_LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Public)
+                .into());
+        }
         // Skills over MCP (`skill://…`) — a verbatim lookup in a static table,
         // so there is no filesystem and no traversal surface. See skills.rs.
         if let Some((mime, text)) = skills::read(uri) {
@@ -876,12 +952,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let outcome = running.waiting().await;
     // Session over. Report how long the agent stayed and how much it did —
     // buckets only, and only if it ever completed a handshake.
-    if let Some((client_id, _)) = session.client_id.get() {
+    if let Some((client_id, _, harness)) = session.client_id.get() {
         session
             .track(
                 "mcp_client_disconnected",
                 json!({
                     "client": client_id,
+                    "harness": harness,
                     "session_duration_bucket": cosmonic_api::telemetry::session_secs(started.elapsed().as_secs()),
                     "tools_invoked_bucket": cosmonic_api::telemetry::count_results(
                         session.tools_invoked.load(Ordering::Relaxed),
@@ -1325,8 +1402,8 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "served skills name tools this server does not have — re-vendor from \
-             agent-integrations (`node scripts/vendor-agent-skills.mjs && node \
-             scripts/vendor-daemon-skills.mjs`): {unknown:?}"
+             agent-integrations (`node js/packages/scripts/vendor-agent-skills.mjs && node \
+             js/packages/scripts/vendor-daemon-skills.mjs`): {unknown:?}"
         );
         // A cross-check that finds no references is not a passing cross-check.
         assert!(
@@ -1573,6 +1650,17 @@ mod tests {
             assert!(hint.contains("flat `Workload`"), "{tool}: {hint}");
             assert!(hint.contains("spec.components"), "{tool}: {hint}");
         }
+        // A daemon that parses the nesting refuses it by `kind`, as a 400.
+        let by_kind = "unsupported kind \"WorkloadDeployment\" (expected Workload); spec must \
+                       declare at least one component or a service";
+        let (code, hint) = refine_for_tool(
+            "invalid_workload".into(),
+            400,
+            by_kind,
+            "cosmonic_workload_apply",
+        );
+        assert_eq!(code, "invalid_workload");
+        assert!(hint.contains("flat `Workload`"), "{hint}");
         // Any other 422 from a workload tool still gets the schema hint...
         let (code, hint) = refine_for_tool(
             "error".into(),

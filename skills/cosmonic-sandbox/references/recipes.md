@@ -56,8 +56,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # p3 (wasi:http/handler@0.3.0). The wasip3 crate carries the WIT (no vendored wit/ dir).
-wasip3 = { version = "0.7.0", features = ["http-compat"] }
-wit-bindgen = { version = "0.57.1", default-features = false, features = ["async", "async-spawn", "inter-task-wakeup"] }
+wasip3 = { version = "0.9.0", features = ["http-compat"] }
+wit-bindgen = { version = "0.62.0", default-features = false, features = ["async", "async-spawn", "inter-task-wakeup"] }
 http-body = "1"
 bytes = "1"
 # serde_json = "1"      # add for JSON
@@ -79,13 +79,17 @@ build:
   component_path: target/wasm32-wasip2/release/my_app.wasm
 ```
 
+**Keep the two versions in step.** `wasip3` 0.9.0 depends on `wit-bindgen` 0.62.0, and the direct
+`wit-bindgen` line names the same version so Cargo builds one async runtime with these features.
+Spawn background tasks with `wasip3::wit_bindgen::spawn_local`.
+
 **No `wit/` dir**: the `wasip3` crate carries the `wasi:http@0.3.0` WIT, and the daemon infers
 `interfaces: ["handler"]` from the export. (Capability shapes that hand-write `wit_bindgen` bindings
 against a p2 interface — e.g. `http-kv-handler` — do vendor a `wit/world.wit`; see `templates.md`.)
 
 ### Build toolchain: Rust 1.94+ for p3
 
-p3 components need **Rust 1.94 or newer**. The `wasip3` 0.7.x crate embeds a
+p3 components need **Rust 1.94 or newer**. The `wasip3` crate embeds a
 component-type section that only `wasm-component-ld` 0.5.20+ can process, and that
 linker ships bundled with Rust 1.94. On an older toolchain the build fails in the
 `wasm-component-ld` link step with a component encode/decode error (the exact
@@ -101,14 +105,19 @@ own toolchain, confirm the one `cargo build` resolves to is 1.94+ with `rustc
 
 ### Running a p3 component with the standalone `wasmtime` CLI (optional)
 
-You don't need `wasmtime` to build or deploy. Cosmonic Desktop's host embeds it (currently 47.0.3)
-and runs p3 components for you, so `cosmonic_dev_start` / `cosmonic_project_publish` is the normal loop. If you
+You don't need `wasmtime` to build or deploy. Cosmonic Desktop's host embeds it and runs p3
+components for you, so `cosmonic_dev_start` / `cosmonic_project_publish` is the normal loop. If you
 want to run a component directly, outside Cosmonic, two things matter.
 
 **Version: wasmtime 46 or newer.** p3's `wasi:http/handler@0.3.0` uses component-model async, so 45
 and older fail with `` `stream` requires the component model async feature``. Validated against this
-template: 46.0.x, 47.0.x, and 48.0.x all serve it; 45 and below do not. Matching the host's 47.x is
-the safest choice.
+template: 46.0.x, 47.0.x, and 48.0.x all serve it; 45 and below do not. Matching the host's version
+is the safest choice.
+
+**MCP servers on `wasmtime serve` 48.x answer 400 today.** The standalone 48.x CLI currently
+rejects MCP requests with `400 Bad Request: missing Host header`. This is an issue in the CLI's
+handling of the Host header, not in your component; Cosmonic Desktop's host serves the same
+component without it.
 
 **Flags: enable cli, p3, and http, or the errors look like a version problem when they aren't.** A
 missing `-S p3` surfaces the async-feature error above; a missing `-S cli` surfaces
@@ -186,7 +195,7 @@ fn respond(status: u16, content_type: &str, body: Vec<u8>) -> Result<Response, E
     let (response, _transmit) = Response::new(headers, Some(body_rx), result_rx);
     response.set_status_code(status)
         .map_err(|()| ErrorCode::InternalError(Some("invalid status code".into())))?;
-    wasip3::wit_bindgen::spawn(async move {
+    wasip3::wit_bindgen::spawn_local(async move {
         let frame = http_body::Frame::data(bytes::Bytes::from(body));
         let _ = writer.send_frame(frame).await;
         drop(writer.stream_writer);            // close the body stream; no trailers

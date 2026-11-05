@@ -3,7 +3,7 @@
 //! same `/v1/...` API the Electron app uses. One short-lived connection per
 //! request (the API is request/response; no streaming here).
 //!
-//! This deliberately mirrors `src/main/daemon.js`: connect to
+//! This deliberately mirrors `js/packages/cosmonic-desktop/src/main/daemon.ts`: connect to
 //! `paths::socket_path()`, speak plain HTTP/JSON, no auth token (the
 //! peer-checked socket/pipe is the trust boundary).
 
@@ -57,6 +57,9 @@ pub struct DaemonClient {
     /// the MCP server (a SIEM asking "did an AI agent stop the daemon?" gets
     /// the wrong answer).
     origin: &'static str,
+    /// The `x-cosmonic-deploy-source` intent (`template`, `registry`, ...) a
+    /// surface that knows it sends with an apply; see [`DaemonClient::for_ui`].
+    deploy_source: Option<&'static str>,
 }
 
 impl DaemonClient {
@@ -65,7 +68,20 @@ impl DaemonClient {
         Ok(Self {
             socket: Self::resolved_socket()?,
             origin: cosmonic_api::workload::SOURCE_MCP,
+            deploy_source: None,
         })
+    }
+
+    /// The same daemon, tagged as a user action in a UI rather than a model's
+    /// tool call: what the plugin's embedded workspace sends when the user
+    /// clicks Start, Stop or Launch (`x-cosmonic-origin: ui`, as Desktop's own
+    /// UI does), plus the deploy intent Desktop's screens attach to an apply.
+    pub fn for_ui(&self, deploy_source: Option<&'static str>) -> Self {
+        Self {
+            socket: self.socket.clone(),
+            origin: cosmonic_api::workload::SOURCE_UI,
+            deploy_source,
+        }
     }
 
     /// Same resolution, tagged as a direct CLI invocation (`cosmonicd stop`)
@@ -74,6 +90,7 @@ impl DaemonClient {
         Ok(Self {
             socket: Self::resolved_socket()?,
             origin: cosmonic_api::workload::SOURCE_CLI,
+            deploy_source: None,
         })
     }
 
@@ -100,6 +117,7 @@ impl DaemonClient {
         Self {
             socket,
             origin: cosmonic_api::workload::SOURCE_MCP,
+            deploy_source: None,
         }
     }
 
@@ -157,6 +175,9 @@ impl DaemonClient {
         // usage (`mcp.tool` events). Absent outside a tool dispatch.
         if let Ok(tool) = crate::server::CURRENT_TOOL.try_with(|t| t.clone()) {
             req = req.header("x-cosmonic-mcp-tool", tool);
+        }
+        if let Some(source) = self.deploy_source {
+            req = req.header("x-cosmonic-deploy-source", source);
         }
         if body.is_some() {
             req = req.header(hyper::header::CONTENT_TYPE, "application/json");
@@ -390,5 +411,72 @@ mod tests {
                 "{status}: collapsed continuation in {message:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod origin_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One request against a throwaway socket; returns the raw request head.
+    async fn capture(client: impl FnOnce(PathBuf) -> DaemonClient) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "cosmonic-origin-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        client(sock)
+            .request("POST", "/v1/workloads", Some(serde_json::json!({})))
+            .await
+            .unwrap();
+        let head = server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        head.to_ascii_lowercase()
+    }
+    fn rand_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[tokio::test]
+    async fn model_calls_are_mcp_and_workspace_clicks_are_ui() {
+        let mcp = |socket| DaemonClient {
+            socket,
+            origin: cosmonic_api::workload::SOURCE_MCP,
+            deploy_source: None,
+        };
+        let head = capture(mcp).await;
+        assert!(head.contains("x-cosmonic-origin: mcp"), "{head}");
+        assert!(!head.contains("x-cosmonic-deploy-source"), "{head}");
+
+        let ui = |socket| {
+            DaemonClient {
+                socket,
+                origin: cosmonic_api::workload::SOURCE_MCP,
+                deploy_source: None,
+            }
+            .for_ui(Some("template"))
+        };
+        let head = capture(ui).await;
+        assert!(head.contains("x-cosmonic-origin: ui"), "{head}");
+        assert!(
+            head.contains("x-cosmonic-deploy-source: template"),
+            "{head}"
+        );
     }
 }
