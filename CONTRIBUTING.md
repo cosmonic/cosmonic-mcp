@@ -4,14 +4,14 @@
 
 This repository is a **mirror**. The crate is developed in
 [`cosmonic/desktop`](https://github.com/cosmonic/desktop) at
-`daemon/crates/cosmonic-mcp`, where it is built and tested against the daemon it
+`rust/crates/cosmonic-mcp`, where it is built and tested against the daemon it
 drives — the two ship together and the MCP surface has a contract test on each
 side.
 
 Open issues here; open pull requests against `cosmonic/desktop`.
 
-`scripts/sync-from-desktop.sh` copies `src/`, `skills/` and the `cosmonic-api`
-wire types across and stamps the version. It is the only way this repo's source
+`scripts/sync-from-desktop.sh` copies `src/`, `skills/`, the built MCP App
+(`ui/index.html`) and the `cosmonic-api` wire types across and stamps the version. It is the only way this repo's source
 should change; `--check` makes it a drift tripwire. The `Cargo.toml` files are
 deliberately NOT synced — the monorepo's are workspace-relative and this repo's
 are standalone — so when a dependency version moves there, move it here by hand
